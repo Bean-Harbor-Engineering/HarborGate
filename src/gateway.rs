@@ -536,6 +536,11 @@ impl GatewayService {
                     "conversation_handle".into(),
                     json!(task_result.conversation_handle),
                 );
+                if let Some(message_id) =
+                    library_photo_confirmation_context(&inbound, task_result.active_frame.as_ref())
+                {
+                    metadata.insert("whatsapp_context_message_id".into(), json!(message_id));
+                }
                 metadata.insert(
                     "active_frame".into(),
                     task_result.active_frame.unwrap_or(Value::Null),
@@ -2258,6 +2263,27 @@ fn sweep_expired_attachment_cache(
     Ok(())
 }
 
+fn library_photo_confirmation_context<'a>(
+    inbound: &'a InboundMessage,
+    active_frame: Option<&Value>,
+) -> Option<&'a str> {
+    (inbound.platform == "whatsapp"
+        && !inbound.message_id.is_empty()
+        && inbound.message_id.len() <= 512
+        && inbound
+            .message_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+        && inbound.attachments.len() == 1
+        && inbound.attachments[0]["type"] == "image"
+        && inbound.attachments[0]["metadata"]["provider"] == "whatsapp"
+        && active_frame
+            .and_then(|frame| frame.get("kind"))
+            .and_then(Value::as_str)
+            == Some("library.photo_confirmation"))
+    .then_some(inbound.message_id.as_str())
+}
+
 fn gateway_turn_to_inbound(payload: &Value) -> Result<InboundMessage, GatewayError> {
     let channel = first_string(
         payload,
@@ -3026,6 +3052,40 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn only_library_photo_confirmation_replies_to_inbound_image() {
+        let mut inbound: InboundMessage = serde_json::from_value(json!({
+            "platform": "whatsapp",
+            "chat_id": "15555550101",
+            "user_id": "15555550101",
+            "text": "",
+            "message_id": "wamid.image-1",
+            "attachments": [{"type":"image","metadata":{"provider":"whatsapp"}}]
+        }))
+        .unwrap();
+        let frame = json!({"kind":"library.photo_confirmation"});
+        assert_eq!(
+            library_photo_confirmation_context(&inbound, Some(&frame)),
+            Some("wamid.image-1")
+        );
+        assert_eq!(library_photo_confirmation_context(&inbound, None), None);
+        assert_eq!(
+            library_photo_confirmation_context(&inbound, Some(&json!({"kind":"other"}))),
+            None
+        );
+        inbound.attachments.clear();
+        assert_eq!(
+            library_photo_confirmation_context(&inbound, Some(&frame)),
+            None
+        );
+        inbound.attachments = vec![json!({"type":"image","metadata":{"provider":"whatsapp"}})];
+        inbound.message_id = "bad\nmessage-id".into();
+        assert_eq!(
+            library_photo_confirmation_context(&inbound, Some(&frame)),
+            None
+        );
+    }
 
     async fn camera_authorization_fixture(
         config: &mut AppConfig,

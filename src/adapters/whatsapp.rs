@@ -580,6 +580,19 @@ impl WhatsAppAdapter {
             ));
         }
         let mut body = json!({"messaging_product":"whatsapp","recipient_type":"individual","to":outbound.chat_id});
+        if let Some(message_id) = outbound
+            .metadata
+            .get("whatsapp_context_message_id")
+            .and_then(Value::as_str)
+        {
+            if message_id.is_empty()
+                || message_id.len() > 512
+                || !message_id.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(GatewayError::validation("Invalid WhatsApp reply context"));
+            }
+            body["context"] = json!({"message_id": message_id});
+        }
         if let Some(media) = prepared {
             body["type"] = json!("image");
             body["image"] = json!({"id":media.provider_media_id});
@@ -1227,6 +1240,36 @@ mod tests {
             .push(json!({"url":"https://example.com/private.jpg"}));
         assert!(a.message_body(&out, None).is_err());
         assert!(!a.profile().to_string().contains("test-token"));
+    }
+
+    #[test]
+    fn library_photo_confirmation_references_original_message() {
+        let a = adapter();
+        let mut outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: "15555550101".into(),
+            text: "Save this photo?".into(),
+            attachments: vec![],
+            timestamp: utc_now_iso(),
+            metadata: Default::default(),
+        };
+        assert!(a
+            .message_body(&outbound, None)
+            .unwrap()
+            .get("context")
+            .is_none());
+        outbound
+            .metadata
+            .insert("whatsapp_context_message_id".into(), json!("wamid.image-1"));
+        let body = a.message_body(&outbound, None).unwrap();
+        assert_eq!(body["context"]["message_id"], "wamid.image-1");
+        assert_eq!(body["type"], "text");
+        assert_eq!(body["text"]["body"], "Save this photo?");
+        outbound.metadata.insert(
+            "whatsapp_context_message_id".into(),
+            json!("bad\nmessage-id"),
+        );
+        assert!(a.message_body(&outbound, None).is_err());
     }
     #[test]
     fn inbox_deduplicates_and_survives_restart() {
