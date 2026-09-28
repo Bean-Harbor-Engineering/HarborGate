@@ -2,7 +2,9 @@ use crate::adapters::feishu::FeishuAdapter;
 use crate::adapters::feishu_mail::FeishuMailAdapter;
 use crate::adapters::webhook::WebhookAdapter;
 use crate::adapters::weixin::WeixinAdapter;
-use crate::adapters::whatsapp::{InboundMediaBytes, WhatsAppAdapter, WhatsAppConfig};
+use crate::adapters::whatsapp::{
+    InboundMediaBytes, InboundMediaReference, WhatsAppAdapter, WhatsAppConfig,
+};
 use crate::adapters::{PlatformAdapter, PreparedOutbound};
 use crate::cloud_relay::CloudRelayClient;
 use crate::config::AppConfig;
@@ -25,6 +27,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -666,6 +669,23 @@ impl GatewayService {
         route_key: &str,
         hub_id: &str,
     ) -> Result<InboundMediaBytes, GatewayError> {
+        self.pull_whatsapp_media_with(attachment_id, route_key, hub_id, |record| async move {
+            self.whatsapp_adapter.download_inbound_media(&record).await
+        })
+        .await
+    }
+
+    async fn pull_whatsapp_media_with<F, Fut>(
+        &self,
+        attachment_id: &str,
+        route_key: &str,
+        hub_id: &str,
+        download: F,
+    ) -> Result<InboundMediaBytes, GatewayError>
+    where
+        F: FnOnce(InboundMediaReference) -> Fut,
+        Fut: Future<Output = Result<InboundMediaBytes, GatewayError>>,
+    {
         let record = self
             .whatsapp_adapter
             .inbound_media_reference(attachment_id)?;
@@ -714,10 +734,8 @@ impl GatewayService {
             metadata,
         };
         client.authorize_whatsapp_delivery(&outbound).await?;
-        let bytes = self
-            .whatsapp_adapter
-            .download_inbound_media(&record)
-            .await?;
+        let bytes = download(record.clone()).await?;
+        client.authorize_whatsapp_delivery(&outbound).await?;
         if let (Some(fleet), Some(_)) = (&self.fleet, &record.selection) {
             fleet.check(&outbound)?;
         }
