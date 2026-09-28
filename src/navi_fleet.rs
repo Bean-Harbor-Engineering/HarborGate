@@ -605,5 +605,29 @@ impl Selection {
 }
 
 #[cfg(test)]
+impl NaviFleet {
+    pub(crate) fn activate_for_media_test(
+        &self,
+        pairing: &InboundMessage,
+        identity: &str,
+    ) -> Result<Selection, GatewayError> {
+        self.begin(pairing)?;
+        let pending = self.claim()?.ok_or_else(unavailable)?;
+        let now = now();
+        self.finish(
+            &pending,
+            StatusCode::OK,
+            &json!({"status":"bound","session_id":"a".repeat(32),
+                "binding_id":"a".repeat(32),"confirmed_at":now,"expires_at":now+300}),
+            identity,
+        )?;
+        let mut ordinary = pairing.clone();
+        ordinary.text.clear();
+        ordinary.timestamp = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+        self.select(&ordinary)
+    }
+}
+
+#[cfg(test)]
 #[path = "navi_fleet_tests.rs"]
 mod tests;

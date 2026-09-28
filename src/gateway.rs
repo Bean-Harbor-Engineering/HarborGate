@@ -2,7 +2,7 @@ use crate::adapters::feishu::FeishuAdapter;
 use crate::adapters::feishu_mail::FeishuMailAdapter;
 use crate::adapters::webhook::WebhookAdapter;
 use crate::adapters::weixin::WeixinAdapter;
-use crate::adapters::whatsapp::{WhatsAppAdapter, WhatsAppConfig};
+use crate::adapters::whatsapp::{InboundMediaBytes, WhatsAppAdapter, WhatsAppConfig};
 use crate::adapters::{PlatformAdapter, PreparedOutbound};
 use crate::cloud_relay::CloudRelayClient;
 use crate::config::AppConfig;
@@ -33,6 +33,9 @@ use uuid::Uuid;
 #[cfg(test)]
 #[path = "whatsapp_delivery_tests.rs"]
 mod whatsapp_delivery_tests;
+#[cfg(test)]
+#[path = "whatsapp_media_tests.rs"]
+mod whatsapp_media_tests;
 
 #[cfg(test)]
 #[path = "gateway_fleet_tests.rs"]
@@ -415,6 +418,8 @@ impl GatewayService {
         let adapter = self
             .adapter(adapter_name)
             .ok_or_else(|| GatewayError::validation(format!("Unknown adapter: {adapter_name}")))?;
+        let media_payload = (adapter_name == "whatsapp" && payload["message"]["type"] == "image")
+            .then(|| payload.clone());
         let inbound = adapter.normalize_inbound(payload)?;
         let selection = if inbound.platform == "whatsapp" {
             if let Some(fleet) = &self.fleet {
@@ -474,6 +479,14 @@ impl GatewayService {
         let (reply_text, outbound_attachments, mut outbound_metadata, next_metadata) =
             if let Some(task_client) = &selected_client {
                 let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
+                if let Some(media_payload) = &media_payload {
+                    self.whatsapp_adapter.stage_inbound_media(
+                        media_payload,
+                        &inbound,
+                        selection.as_ref(),
+                        task_result.conversation_handle.as_deref().unwrap_or(""),
+                    )?;
+                }
                 let attachment_candidates =
                     native_source_bound_attachments(adapter_name, &task_result.response_payload);
                 let reply_text = render_retrieval_reply(
@@ -539,6 +552,11 @@ impl GatewayService {
                 metadata.insert("native_attachment_materialize_failed".into(), json!(0));
                 (reply_text, attachment_candidates, metadata, next_metadata)
             } else {
+                if media_payload.is_some() {
+                    return Err(GatewayError::infrastructure(
+                        "WhatsApp image intake requires HarborBeacon",
+                    ));
+                }
                 let mut next_metadata = session_metadata.clone();
                 next_metadata.insert("route_key".into(), json!(resolved_route_key));
                 next_metadata.insert("session_id".into(), json!(resolved_session_id));
@@ -626,6 +644,72 @@ impl GatewayService {
             None,
         )
         .await
+    }
+
+    pub(crate) async fn pull_whatsapp_media(
+        &self,
+        attachment_id: &str,
+        route_key: &str,
+        hub_id: &str,
+    ) -> Result<InboundMediaBytes, GatewayError> {
+        let record = self
+            .whatsapp_adapter
+            .inbound_media_reference(attachment_id)?;
+        let denied = || {
+            GatewayError::new(
+                StatusCode::FORBIDDEN,
+                "WHATSAPP_MEDIA_NOT_ALLOWED",
+                "WhatsApp image route is no longer authorized",
+            )
+        };
+        if route_key.is_empty() || route_key != record.route_key {
+            return Err(denied());
+        }
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("route_key".into(), json!(record.route_key));
+        metadata.insert(
+            "conversation_handle".into(),
+            json!(record.conversation_handle),
+        );
+        let client = match (&self.fleet, &record.selection) {
+            (Some(fleet), Some(selection)) if hub_id == selection.hub_id => {
+                metadata.insert("navi_selection".into(), json!(selection));
+                let outbound = OutboundMessage {
+                    platform: "whatsapp".into(),
+                    chat_id: record.recipient.clone(),
+                    text: String::new(),
+                    attachments: vec![json!({"kind":"image"})],
+                    timestamp: crate::models::utc_now_iso(),
+                    metadata: metadata.clone(),
+                };
+                fleet.check(&outbound)?;
+                HarborBeaconTaskClient::from_cloud_relay(
+                    fleet.relay.with_hub_identity(&selection.hub_identity)?,
+                    &selection.hub_id,
+                )?
+            }
+            (None, None) if hub_id == "local" => self.task_client.clone().ok_or_else(denied)?,
+            _ => return Err(denied()),
+        };
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: record.recipient.clone(),
+            text: String::new(),
+            attachments: vec![json!({"kind":"image"})],
+            timestamp: crate::models::utc_now_iso(),
+            metadata,
+        };
+        client.authorize_whatsapp_delivery(&outbound).await?;
+        let bytes = self
+            .whatsapp_adapter
+            .download_inbound_media(&record)
+            .await?;
+        if let (Some(fleet), Some(_)) = (&self.fleet, &record.selection) {
+            fleet.check(&outbound)?;
+        }
+        self.whatsapp_adapter
+            .inbound_media_reference(attachment_id)?;
+        Ok(bytes)
     }
 
     pub async fn handle_gateway_turn(&self, payload: Value) -> Result<Value, GatewayError> {
