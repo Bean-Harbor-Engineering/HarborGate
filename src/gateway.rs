@@ -566,6 +566,11 @@ impl GatewayService {
                     "native_attachment_count".into(),
                     json!(attachment_candidates.len()),
                 );
+                if adapter_name == "whatsapp" {
+                    let source_refs = source_revalidation_refs(&task_result.response_payload)?;
+                    metadata.insert("source_auth_schema".into(), json!(1));
+                    metadata.insert("source_revalidation_refs".into(), json!(source_refs));
+                }
                 metadata.insert("native_attachment_materialize_failed".into(), json!(0));
                 (reply_text, attachment_candidates, metadata, next_metadata)
             } else {
@@ -1134,6 +1139,17 @@ impl GatewayService {
         outbound: &OutboundMessage,
     ) -> Result<(), GatewayError> {
         let result: Result<(), GatewayError> = async {
+            if outbound.platform == "whatsapp"
+                && outbound.metadata.get("source").and_then(Value::as_str) == Some("harborbeacon")
+                && (outbound.metadata.get("source_auth_schema") != Some(&json!(1))
+                    || !outbound.metadata.contains_key("source_revalidation_refs"))
+            {
+                return Err(GatewayError::new(
+                    StatusCode::FORBIDDEN,
+                    "IM_DELIVERY_NOT_ALLOWED",
+                    "Queued WhatsApp reply lacks source authorization metadata",
+                ));
+            }
             self.authorize_camera_delivery(outbound).await?;
             if outbound.platform == "whatsapp" {
                 let client = self.outbound_task_client(outbound)?;
@@ -2688,6 +2704,32 @@ fn artifact_candidates(response_payload: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn source_revalidation_refs(response_payload: &Value) -> Result<Vec<String>, GatewayError> {
+    let references = artifact_candidates(response_payload)
+        .into_iter()
+        .filter(|artifact| artifact["kind"] == "source_reference")
+        .take(6)
+        .collect::<Vec<_>>();
+    if references.len() > 5 {
+        return Err(GatewayError::infrastructure(
+            "Too many source references in reply",
+        ));
+    }
+    references
+        .iter()
+        .map(|artifact| {
+            artifact
+                .pointer("/metadata/delivery_auth_ref")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty() && token.len() <= 2048)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    GatewayError::infrastructure("Source reference authorization is unavailable")
+                })
+        })
+        .collect()
+}
+
 fn native_image_limit(response_payload: &Value) -> Option<usize> {
     let hint = response_payload
         .get("delivery_hints")
@@ -4096,6 +4138,211 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read(corrupt).unwrap(), original);
+    }
+
+    #[test]
+    fn text_only_source_references_require_opaque_delivery_tokens() {
+        let response = json!({"artifacts":[
+            {"kind":"source_reference","label":"receipt","metadata":{"delivery_auth_ref":"opaque-library"}},
+            {"kind":"source_reference","label":"camera","metadata":{"delivery_auth_ref":"opaque-timeline"}}
+        ]});
+        assert_eq!(
+            source_revalidation_refs(&response).unwrap(),
+            ["opaque-library", "opaque-timeline"]
+        );
+        let rendered =
+            render_retrieval_reply("The answer cites both sources", &response, false, "");
+        assert!(!rendered.contains("opaque-library"));
+        assert!(!rendered.contains("opaque-timeline"));
+        let missing = json!({"artifacts":[{"kind":"source_reference","label":"receipt"}]});
+        assert!(source_revalidation_refs(&missing).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_queued_beacon_reply_is_denied_after_restart() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url.clear();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(RetryOnceAdapter {
+            attempts: sends.clone(),
+        });
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: "15555550101".into(),
+            text: "old answer cites a private photo".into(),
+            attachments: vec![],
+            metadata: json!({"source":"harborbeacon","adapter":"retry_once",
+                "conversation_handle":"old-handle","route_key":"fixture-route"})
+            .as_object()
+            .unwrap()
+            .clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let gateway = GatewayService::from_config(&config).unwrap();
+        let items = split_outbound_items(outbound.clone()).unwrap();
+        let planned_items = items
+            .iter()
+            .map(|(identity, artifact_id, kind, item)| DeliveryPlanItem {
+                item_key: delivery_item_key("legacy-source", identity),
+                artifact_id: artifact_id.clone(),
+                kind: kind.clone(),
+                planned_outbound: serde_json::to_value(item).unwrap(),
+                materialization_required: false,
+            })
+            .collect();
+        gateway
+            .store
+            .persist_delivery_plan(
+                "legacy-source",
+                "same-plan",
+                serde_json::to_value(&outbound).unwrap(),
+                planned_items,
+            )
+            .unwrap();
+        drop(gateway);
+        let mut restarted = GatewayService::from_config(&config).unwrap();
+        restarted.adapters.insert("retry_once".into(), adapter);
+        assert_eq!(restarted.retry_pending_deliveries().await.unwrap(), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        assert!(restarted
+            .store
+            .retryable_delivery_plans()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_refs_are_rechecked_on_valid_retry_after_restart() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_token = "fixture-service-token".into();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.harborbeacon_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/im/whatsapp/delivery-authorization",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let observed = observed.clone();
+                    async move {
+                        assert_eq!(
+                            body["source_refs"],
+                            json!(["opaque-library", "opaque-timeline"])
+                        );
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"allowed":true}))
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(RetryOnceAdapter {
+            attempts: attempts.clone(),
+        });
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: "15555550101".into(),
+            text: "answer with two citations".into(),
+            attachments: vec![],
+            metadata: json!({"source":"harborbeacon","adapter":"retry_once","source_auth_schema":1,
+                "source_revalidation_refs":["opaque-library","opaque-timeline"],
+                "conversation_handle":"fixture-handle","route_key":"fixture-route"})
+            .as_object()
+            .unwrap()
+            .clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let gateway = GatewayService::from_config(&config).unwrap();
+        assert!(gateway
+            .deliver_outbound_items_guarded(
+                adapter.clone(),
+                outbound.clone(),
+                "source-retry",
+                "same-plan",
+                None
+            )
+            .await
+            .is_err());
+        drop(gateway);
+        let mut restarted = GatewayService::from_config(&config).unwrap();
+        restarted.adapters.insert("retry_once".into(), adapter);
+        assert_eq!(restarted.retry_pending_deliveries().await.unwrap(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(checks.load(Ordering::SeqCst) >= 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn revoked_source_ref_blocks_queued_text_on_retry() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_token = "fixture-service-token".into();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.harborbeacon_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let authorized = Arc::new(AtomicUsize::new(1));
+        let current = authorized.clone();
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/im/whatsapp/delivery-authorization",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let current = current.clone();
+                    async move {
+                        assert_eq!(body["source_refs"], json!(["opaque-library"]));
+                        if current.load(Ordering::SeqCst) == 1 {
+                            (StatusCode::OK, axum::Json(json!({"allowed":true})))
+                        } else {
+                            (StatusCode::FORBIDDEN, axum::Json(json!({"allowed":false})))
+                        }
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(RetryOnceAdapter {
+            attempts: attempts.clone(),
+        });
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: "15555550101".into(),
+            text: "private OCR text".into(),
+            attachments: vec![],
+            metadata: json!({"source":"harborbeacon","adapter":"retry_once",
+                "source_auth_schema":1,"source_revalidation_refs":["opaque-library"],
+                "conversation_handle":"fixture-handle","route_key":"fixture-route"})
+            .as_object()
+            .unwrap()
+            .clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let gateway = GatewayService::from_config(&config).unwrap();
+        assert!(gateway
+            .deliver_outbound_items_guarded(
+                adapter.clone(),
+                outbound,
+                "revoked-source-retry",
+                "same-plan",
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        drop(gateway);
+        authorized.store(0, Ordering::SeqCst);
+        let mut restarted = GatewayService::from_config(&config).unwrap();
+        restarted.adapters.insert("retry_once".into(), adapter);
+        assert_eq!(restarted.retry_pending_deliveries().await.unwrap(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]
