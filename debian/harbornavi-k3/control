@@ -3,7 +3,7 @@ Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
 Architecture: ARCH_PLACEHOLDER
-Depends: harboros-system (>= 0.1.0+harbornavi.k3.evt1), harboros-system (<< 0.2), libc6, ca-certificates, init-system-helpers, util-linux
+Depends: harboros-system, libc6, ca-certificates, init-system-helpers, util-linux
 X-HarborOS-Dependency-Closure: central-ubuntu-26.04-resolver-required
 Provides: harboros-service-auth-abi (= 1)
 Maintainer: Harborinno Ltd.
