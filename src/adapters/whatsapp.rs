@@ -1601,6 +1601,29 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn ordinary_image_above_five_decimal_megabytes_is_rejected_before_upload() {
+        assert_eq!(MAX_WHATSAPP_IMAGE_BYTES, 5_000_000);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oversized.jpg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(5_000_001)
+            .unwrap();
+        let mut adapter = adapter();
+        adapter.cache = root.path().to_path_buf();
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: "15555550101".into(),
+            text: "Photo".into(),
+            attachments: vec![json!({"mime_type":"image/jpeg","path":path})],
+            timestamp: utc_now_iso(),
+            metadata: serde_json::Map::new(),
+        };
+        let error = adapter.prepare_outbound(&outbound).await.unwrap_err();
+        assert_eq!(error.code, "VALIDATION_ERROR");
+        assert_eq!(error.message, "WhatsApp image is too large");
+    }
+    #[tokio::test]
     async fn converted_preview_honors_exif_and_rejects_malformed_or_oversized_dimensions() {
         let source = image::RgbImage::from_pixel(24, 12, image::Rgb([40, 80, 120]));
         let mut jpeg = Vec::new();
