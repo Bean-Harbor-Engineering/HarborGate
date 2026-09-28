@@ -2334,7 +2334,7 @@ fn library_photo_confirmation_preview(
     let photo = &inbound.attachments[0];
     if !matches!(
         photo["mime_type"].as_str(),
-        Some("image/jpeg" | "image/png")
+        Some("image/jpeg" | "image/png" | "image/webp")
     ) {
         return None;
     }
@@ -3158,7 +3158,7 @@ mod tests {
             "wamid.image-1"
         );
         inbound.attachments[0]["mime_type"] = json!("image/webp");
-        assert!(library_photo_confirmation_preview(&inbound, Some(&frame), "Save?").is_none());
+        assert!(library_photo_confirmation_preview(&inbound, Some(&frame), "Save?").is_some());
         inbound.attachments[0]["mime_type"] = json!("image/png");
         assert!(
             library_photo_confirmation_preview(&inbound, Some(&frame), &"x".repeat(1025)).is_none()

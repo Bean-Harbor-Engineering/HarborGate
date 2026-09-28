@@ -31,6 +31,7 @@ ecb = { version = "0.1", features = ["alloc"] }
 futures-util = "0.3"
 fs2 = "0.4"
 hmac = "0.12"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 md5 = "0.7"
 mime_guess = "2"
 prost = "0.13"

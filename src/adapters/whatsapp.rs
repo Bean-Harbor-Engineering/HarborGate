@@ -11,6 +11,7 @@ use crate::{
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use hmac::{Hmac, Mac};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 use reqwest::{
     multipart::{Form, Part},
     Client,
@@ -20,12 +21,21 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use sha2::Sha256;
 use std::{
+    io::Cursor,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
+use tokio::sync::Semaphore;
 use url::Url;
 
 const MAX_INBOUND_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_WHATSAPP_IMAGE_BYTES: usize = 5_000_000;
+const MAX_PREVIEW_DIMENSION: u32 = 12_000;
+const MAX_PREVIEW_PIXELS: u64 = 60_000_000;
+const MAX_PREVIEW_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+const PREVIEW_MAX_SIDE: u32 = 2_000;
+static PREVIEW_DECODER: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 const INBOUND_MEDIA_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -126,7 +136,10 @@ impl WhatsAppAdapter {
             || outbound.attachments.len() != 1
             || attachment["kind"] != "image"
             || attachment["mime_type"] != record.mime_type
-            || !matches!(record.mime_type.as_str(), "image/jpeg" | "image/png")
+            || !matches!(
+                record.mime_type.as_str(),
+                "image/jpeg" | "image/png" | "image/webp"
+            )
             || attachment.get("path").is_some()
             || attachment.get("url").is_some()
             || source_message_id.is_empty()
@@ -798,10 +811,19 @@ impl PlatformAdapter for WhatsAppAdapter {
         }
         let item = &outbound.attachments[0];
         let mime = item["mime_type"].as_str().unwrap_or("");
-        let filename = image_filename(mime).ok_or_else(|| {
-            GatewayError::validation("WhatsApp supports JPEG, PNG, or WebP image replies")
-        })?;
         let preview = self.confirmation_preview_source(outbound)?;
+        let filename = if preview.is_some() {
+            "preview.jpg"
+        } else {
+            match mime {
+                "image/jpeg" | "image/png" => image_filename(mime).unwrap(),
+                _ => {
+                    return Err(GatewayError::validation(
+                        "WhatsApp image replies support JPEG or PNG",
+                    ))
+                }
+            }
+        };
         let bytes = if let Some(record) = preview.as_ref() {
             self.download_inbound_media(record)
                 .await
@@ -820,18 +842,24 @@ impl PlatformAdapter for WhatsAppAdapter {
                 cap_std::fs::Dir::open_ambient_dir(&self.cache, cap_std::ambient_authority())
                     .map_err(|_| denied())?;
             let mut file = root.open(relative).map_err(|_| denied())?;
-            if file.metadata().map_err(|_| denied())?.len() > 5 * 1024 * 1024 {
+            if file.metadata().map_err(|_| denied())?.len() > MAX_WHATSAPP_IMAGE_BYTES as u64 {
                 return Err(GatewayError::validation("WhatsApp image is too large"));
             }
             use std::io::Read;
             let mut bytes = Vec::new();
             file.by_ref()
-                .take(5 * 1024 * 1024 + 1)
+                .take(MAX_WHATSAPP_IMAGE_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|_| denied())?;
             bytes
         };
-        if bytes.is_empty() || bytes.len() > 5 * 1024 * 1024 {
+        let (bytes, upload_mime, filename) = if preview.is_some() {
+            let (bytes, mime) = confirmation_preview_bytes(bytes, mime).await?;
+            (bytes, mime, filename)
+        } else {
+            (bytes, mime, filename)
+        };
+        if bytes.is_empty() || bytes.len() > MAX_WHATSAPP_IMAGE_BYTES {
             return Err(if preview.is_some() {
                 GatewayError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -846,7 +874,7 @@ impl PlatformAdapter for WhatsAppAdapter {
             "file",
             Part::bytes(bytes)
                 .file_name(filename)
-                .mime_str(mime)
+                .mime_str(upload_mime)
                 .map_err(|_| denied())?,
         );
         let response = self
@@ -932,6 +960,123 @@ impl PlatformAdapter for WhatsAppAdapter {
         "business_number":if self.config.configured(){Some(&self.config.business_number)}else{None}})
     }
 }
+async fn confirmation_preview_bytes(
+    bytes: Vec<u8>,
+    mime_type: &str,
+) -> Result<(Vec<u8>, &'static str), GatewayError> {
+    if bytes.is_empty() || bytes.len() > MAX_INBOUND_IMAGE_BYTES {
+        return Err(preview_unavailable());
+    }
+    let permit = tokio::time::timeout(
+        Duration::from_secs(10),
+        PREVIEW_DECODER.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| preview_unavailable())?
+    .map_err(|_| preview_unavailable())?;
+    let format = match mime_type {
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/png" => ImageFormat::Png,
+        "image/webp" => ImageFormat::WebP,
+        _ => return Err(preview_unavailable()),
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        transcode_confirmation_preview(&bytes, format)
+    });
+    let encoded = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .map_err(|_| preview_unavailable())?
+        .map_err(|_| preview_unavailable())?
+        .ok_or_else(preview_unavailable)?;
+    Ok((encoded, "image/jpeg"))
+}
+
+fn transcode_confirmation_preview(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
+    if image::guess_format(bytes).ok()? != format {
+        return None;
+    }
+    match format {
+        ImageFormat::Jpeg if !bytes.ends_with(&[0xff, 0xd9]) => return None,
+        ImageFormat::Png if !bytes.ends_with(b"\0\0\0\0IEND\xaeB`\x82") => return None,
+        ImageFormat::WebP
+            if bytes.len() < 12
+                || usize::try_from(u32::from_le_bytes(bytes[4..8].try_into().ok()?))
+                    .ok()?
+                    .checked_add(8)?
+                    != bytes.len() =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+    if format == ImageFormat::WebP
+        && image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
+            .ok()?
+            .has_animation()
+    {
+        return None;
+    }
+    if format == ImageFormat::Png
+        && image::codecs::png::PngDecoder::new(Cursor::new(bytes))
+            .ok()?
+            .is_apng()
+            .ok()?
+    {
+        return None;
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_PREVIEW_DIMENSION);
+    limits.max_image_height = Some(MAX_PREVIEW_DIMENSION);
+    limits.max_alloc = Some(MAX_PREVIEW_DECODE_BYTES);
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().ok()?;
+    let (width, height) = decoder.dimensions();
+    if width == 0
+        || height == 0
+        || width > MAX_PREVIEW_DIMENSION
+        || height > MAX_PREVIEW_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_PREVIEW_PIXELS
+    {
+        return None;
+    }
+    let orientation = decoder.orientation().ok()?;
+    let mut image = DynamicImage::from_decoder(decoder).ok()?;
+    image.apply_orientation(orientation);
+    let mut preview = if image.width() > PREVIEW_MAX_SIDE || image.height() > PREVIEW_MAX_SIDE {
+        image.thumbnail(PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE)
+    } else {
+        image
+    };
+    for side in [PREVIEW_MAX_SIDE, 1_600, 1_200] {
+        if preview.width() > side || preview.height() > side {
+            preview = preview.thumbnail(side, side);
+        }
+        let rgb = if preview.color().has_alpha() {
+            let mut canvas = image::RgbaImage::from_pixel(
+                preview.width(),
+                preview.height(),
+                image::Rgba([255, 255, 255, 255]),
+            );
+            image::imageops::overlay(&mut canvas, &preview.to_rgba8(), 0, 0);
+            DynamicImage::ImageRgba8(canvas).to_rgb8()
+        } else {
+            preview.to_rgb8()
+        };
+        for quality in [85, 72, 60] {
+            let mut encoded = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality)
+                .encode_image(&rgb)
+                .ok()?;
+            if encoded.len() <= MAX_WHATSAPP_IMAGE_BYTES {
+                return Some(encoded);
+            }
+        }
+    }
+    None
+}
+
 fn denied() -> GatewayError {
     GatewayError::new(
         StatusCode::FORBIDDEN,
@@ -1058,6 +1203,7 @@ fn media_invalid() -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
     fn adapter() -> WhatsAppAdapter {
         WhatsAppAdapter::new(
             WhatsAppConfig {
@@ -1312,6 +1458,182 @@ mod tests {
         outbound.chat_id = inbound.chat_id;
         outbound.attachments[0]["mime_type"] = json!("image/webp");
         assert!(adapter.confirmation_preview_source(&outbound).is_err());
+
+        let webp_payload = json!({"phone_number_id":"123","message":{"from":"15555550101",
+            "id":"wamid.webp.preview","timestamp":chrono::Utc::now().timestamp().to_string(),"type":"image",
+            "image":{"id":"2754859441498129","mime_type":"image/webp","sha256":"d".repeat(64)}}});
+        let webp_inbound = adapter.normalize_inbound(webp_payload.clone()).unwrap();
+        adapter
+            .stage_inbound_media(&webp_payload, &webp_inbound, None, "conv-preview")
+            .unwrap();
+        let webp_outbound = OutboundMessage {
+            chat_id: webp_inbound.chat_id.clone(),
+            attachments: vec![
+                json!({"artifact_id":webp_inbound.attachments[0]["attachment_id"],
+                "kind":"image","mime_type":"image/webp",
+                "metadata":{"whatsapp_inbound_confirmation_preview":true}}),
+            ],
+            metadata: json!({"route_key":webp_inbound.route_key,
+                "conversation_handle":"conv-preview",
+                "whatsapp_context_message_id":webp_inbound.message_id})
+            .as_object()
+            .unwrap()
+            .clone(),
+            ..outbound
+        };
+        assert_eq!(
+            adapter
+                .confirmation_preview_source(&webp_outbound)
+                .unwrap()
+                .unwrap()
+                .mime_type,
+            "image/webp"
+        );
+    }
+    #[tokio::test]
+    async fn webp_preview_becomes_small_jpeg_with_white_transparency() {
+        let source = image::RgbaImage::from_fn(40, 20, |x, _| {
+            if x < 20 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 0, 0])
+            }
+        });
+        let mut original = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut original)
+            .encode(source.as_raw(), 40, 20, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let (preview, mime) = confirmation_preview_bytes(original.clone(), "image/webp")
+            .await
+            .unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(image::guess_format(&preview).unwrap(), ImageFormat::Jpeg);
+        assert!(preview.len() < MAX_WHATSAPP_IMAGE_BYTES);
+        let decoded = image::load_from_memory(&preview).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (40, 20));
+        assert!(decoded.get_pixel(4, 10)[0] > 200);
+        assert!(decoded
+            .get_pixel(35, 10)
+            .0
+            .iter()
+            .all(|channel| *channel > 230));
+        assert_eq!(image::guess_format(&original).unwrap(), ImageFormat::WebP);
+
+        let mut animated = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\x02\0\0\0\x27\0\0\x13\0\0".to_vec();
+        animated.extend_from_slice(b"ANIM\x06\0\0\0\xff\xff\xff\xff\0\0");
+        animated.extend_from_slice(b"ANMF");
+        animated.extend_from_slice(
+            &u32::try_from(16 + original.len() - 12)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        animated.extend_from_slice(&[0, 0, 0, 0, 0, 0, 39, 0, 0, 19, 0, 0, 100, 0, 0, 0]);
+        animated.extend_from_slice(&original[12..]);
+        let riff_size = u32::try_from(animated.len() - 8).unwrap();
+        animated[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert!(
+            image::codecs::webp::WebPDecoder::new(Cursor::new(&animated))
+                .unwrap()
+                .has_animation()
+        );
+        assert!(transcode_confirmation_preview(&animated, ImageFormat::WebP).is_none());
+    }
+    #[tokio::test]
+    async fn jpeg_and_oversized_png_previews_are_transcoded_without_changing_source() {
+        let source = image::RgbImage::from_pixel(48, 32, image::Rgb([20, 100, 180]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode_image(&source)
+            .unwrap();
+        let (small_preview, mime) = confirmation_preview_bytes(jpeg.clone(), "image/jpeg")
+            .await
+            .unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(
+            image::guess_format(&small_preview).unwrap(),
+            ImageFormat::Jpeg
+        );
+        assert_eq!(
+            image::load_from_memory(&small_preview)
+                .unwrap()
+                .dimensions(),
+            (48, 32)
+        );
+        assert_eq!(image::guess_format(&jpeg).unwrap(), ImageFormat::Jpeg);
+
+        let mut padded_jpeg = jpeg[..2].to_vec();
+        for _ in 0..90 {
+            padded_jpeg.extend_from_slice(&[0xff, 0xef]);
+            padded_jpeg.extend_from_slice(&60_002u16.to_be_bytes());
+            padded_jpeg.extend(std::iter::repeat_n(0, 60_000));
+        }
+        padded_jpeg.extend_from_slice(&jpeg[2..]);
+        assert!(padded_jpeg.len() > MAX_WHATSAPP_IMAGE_BYTES);
+        let (jpeg_preview, mime) = confirmation_preview_bytes(padded_jpeg, "image/jpeg")
+            .await
+            .unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert!(jpeg_preview.len() < MAX_WHATSAPP_IMAGE_BYTES);
+        assert_eq!(
+            image::load_from_memory(&jpeg_preview).unwrap().dimensions(),
+            (48, 32)
+        );
+
+        let noisy = image::RgbImage::from_fn(1_500, 1_500, |x, y| {
+            let mut value = x.wrapping_mul(747_796_405) ^ y.wrapping_mul(2_891_336_453);
+            value ^= value >> 16;
+            value = value.wrapping_mul(2_246_822_519);
+            image::Rgb([(value >> 16) as u8, (value >> 8) as u8, value as u8])
+        });
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(noisy)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        assert!(png.len() > MAX_WHATSAPP_IMAGE_BYTES);
+        assert!(png.len() < MAX_INBOUND_IMAGE_BYTES);
+        let (png_preview, mime) = confirmation_preview_bytes(png, "image/png").await.unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert!(png_preview.len() < MAX_WHATSAPP_IMAGE_BYTES);
+        assert_eq!(
+            image::load_from_memory(&png_preview).unwrap().dimensions(),
+            (1_500, 1_500)
+        );
+    }
+    #[tokio::test]
+    async fn converted_preview_honors_exif_and_rejects_malformed_or_oversized_dimensions() {
+        let source = image::RgbImage::from_pixel(24, 12, image::Rgb([40, 80, 120]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode_image(&source)
+            .unwrap();
+        let exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+        let mut rotated = jpeg[..2].to_vec();
+        rotated.extend_from_slice(&[0xff, 0xe1]);
+        rotated.extend_from_slice(&u16::try_from(exif.len() + 2).unwrap().to_be_bytes());
+        rotated.extend_from_slice(exif);
+        rotated.extend_from_slice(&jpeg[2..]);
+        let preview = transcode_confirmation_preview(&rotated, ImageFormat::Jpeg).unwrap();
+        assert_eq!(
+            image::load_from_memory(&preview).unwrap().dimensions(),
+            (12, 24)
+        );
+        assert!(transcode_confirmation_preview(&rotated, ImageFormat::Png).is_none());
+        assert!(
+            transcode_confirmation_preview(&rotated[..rotated.len() - 2], ImageFormat::Jpeg)
+                .is_none()
+        );
+        let error = confirmation_preview_bytes(rotated[..rotated.len() - 2].to_vec(), "image/jpeg")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "WHATSAPP_PREVIEW_UNAVAILABLE");
+
+        let wide = image::RgbImage::from_pixel(12_001, 1, image::Rgb([1, 2, 3]));
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(wide)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        assert!(transcode_confirmation_preview(&png.into_inner(), ImageFormat::Png).is_none());
     }
     #[test]
     fn media_url_and_file_signatures_are_restricted() {
