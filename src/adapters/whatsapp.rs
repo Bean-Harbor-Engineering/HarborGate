@@ -86,6 +86,66 @@ pub struct WhatsAppAdapter {
     cache: PathBuf,
 }
 impl WhatsAppAdapter {
+    fn confirmation_preview_source(
+        &self,
+        outbound: &OutboundMessage,
+    ) -> Result<Option<InboundMediaReference>, GatewayError> {
+        let Some(attachment) = outbound.attachments.first().filter(|attachment| {
+            attachment["metadata"]["whatsapp_inbound_confirmation_preview"] == true
+        }) else {
+            return Ok(None);
+        };
+        let attachment_id = attachment["artifact_id"].as_str().unwrap_or("");
+        let source_message_id = outbound
+            .metadata
+            .get("whatsapp_context_message_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let record = self.inbound_media_reference(attachment_id)?;
+        let expected_id = crate::harborbeacon::stable_id(
+            "wa_image_",
+            &json!([
+                self.config.phone_number_id,
+                source_message_id,
+                record.provider_media_id
+            ])
+            .to_string(),
+            24,
+        );
+        let selection_matches = match (
+            record.selection.as_ref(),
+            outbound.metadata.get("navi_selection"),
+        ) {
+            (None, None) => true,
+            (Some(selection), Some(value)) => {
+                serde_json::to_value(selection).ok().as_ref() == Some(value)
+            }
+            _ => false,
+        };
+        if outbound.platform != "whatsapp"
+            || outbound.attachments.len() != 1
+            || attachment["kind"] != "image"
+            || attachment["mime_type"] != record.mime_type
+            || !matches!(record.mime_type.as_str(), "image/jpeg" | "image/png")
+            || attachment.get("path").is_some()
+            || attachment.get("url").is_some()
+            || source_message_id.is_empty()
+            || expected_id != attachment_id
+            || record.recipient != outbound.chat_id
+            || outbound.metadata.get("route_key").and_then(Value::as_str)
+                != Some(record.route_key.as_str())
+            || outbound
+                .metadata
+                .get("conversation_handle")
+                .and_then(Value::as_str)
+                != Some(record.conversation_handle.as_str())
+            || !selection_matches
+        {
+            return Err(denied());
+        }
+        Ok(Some(record))
+    }
+
     pub fn new(config: WhatsAppConfig, cache: PathBuf) -> Self {
         Self {
             config,
@@ -741,28 +801,46 @@ impl PlatformAdapter for WhatsAppAdapter {
         let filename = image_filename(mime).ok_or_else(|| {
             GatewayError::validation("WhatsApp supports JPEG, PNG, or WebP image replies")
         })?;
-        let path = Path::new(item["path"].as_str().unwrap_or(""));
-        let relative = path.strip_prefix(&self.cache).map_err(|_| denied())?;
-        if relative
-            .components()
-            .any(|part| !matches!(part, std::path::Component::Normal(_)))
-        {
-            return Err(denied());
-        }
-        let root = cap_std::fs::Dir::open_ambient_dir(&self.cache, cap_std::ambient_authority())
-            .map_err(|_| denied())?;
-        let mut file = root.open(relative).map_err(|_| denied())?;
-        if file.metadata().map_err(|_| denied())?.len() > 5 * 1024 * 1024 {
-            return Err(GatewayError::validation("WhatsApp image is too large"));
-        }
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        file.by_ref()
-            .take(5 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| denied())?;
+        let preview = self.confirmation_preview_source(outbound)?;
+        let bytes = if let Some(record) = preview.as_ref() {
+            self.download_inbound_media(record)
+                .await
+                .map_err(|_| preview_unavailable())?
+                .bytes
+        } else {
+            let path = Path::new(item["path"].as_str().unwrap_or(""));
+            let relative = path.strip_prefix(&self.cache).map_err(|_| denied())?;
+            if relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(denied());
+            }
+            let root =
+                cap_std::fs::Dir::open_ambient_dir(&self.cache, cap_std::ambient_authority())
+                    .map_err(|_| denied())?;
+            let mut file = root.open(relative).map_err(|_| denied())?;
+            if file.metadata().map_err(|_| denied())?.len() > 5 * 1024 * 1024 {
+                return Err(GatewayError::validation("WhatsApp image is too large"));
+            }
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.by_ref()
+                .take(5 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| denied())?;
+            bytes
+        };
         if bytes.is_empty() || bytes.len() > 5 * 1024 * 1024 {
-            return Err(GatewayError::validation("Invalid WhatsApp image"));
+            return Err(if preview.is_some() {
+                GatewayError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "WHATSAPP_PREVIEW_UNAVAILABLE",
+                    "WhatsApp photo preview cannot be uploaded",
+                )
+            } else {
+                GatewayError::validation("Invalid WhatsApp image")
+            });
         }
         let form = Form::new().text("messaging_product", "whatsapp").part(
             "file",
@@ -778,13 +856,29 @@ impl PlatformAdapter for WhatsAppAdapter {
             .multipart(form)
             .send()
             .await
-            .map_err(|_| GatewayError::infrastructure("WhatsApp media upload is unavailable"))?;
-        let result = self.decode(response).await?;
+            .map_err(|_| {
+                if preview.is_some() {
+                    preview_unavailable()
+                } else {
+                    GatewayError::infrastructure("WhatsApp media upload is unavailable")
+                }
+            })?;
+        let result = self.decode(response).await.map_err(|error| {
+            if preview.is_some() {
+                preview_unavailable()
+            } else {
+                error
+            }
+        })?;
         let id = result["id"]
             .as_str()
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                GatewayError::infrastructure("WhatsApp upload did not return a media ID")
+                if preview.is_some() {
+                    preview_unavailable()
+                } else {
+                    GatewayError::infrastructure("WhatsApp upload did not return a media ID")
+                }
             })?;
         Ok(Some(PreparedOutbound {
             provider_media_id: id.into(),
@@ -803,6 +897,9 @@ impl PlatformAdapter for WhatsAppAdapter {
         prepared: Option<&PreparedOutbound>,
     ) -> Result<Value, GatewayError> {
         self.require_config()?;
+        if self.confirmation_preview_source(&outbound)?.is_some() && prepared.is_none() {
+            return Err(denied());
+        }
         let body = self.message_body(&outbound, prepared)?;
         let response = self
             .http
@@ -933,6 +1030,14 @@ fn media_not_found() -> GatewayError {
         StatusCode::NOT_FOUND,
         "WHATSAPP_MEDIA_NOT_FOUND",
         "WhatsApp image reference was not found",
+    )
+}
+
+fn preview_unavailable() -> GatewayError {
+    GatewayError::new(
+        StatusCode::BAD_GATEWAY,
+        "WHATSAPP_PREVIEW_UNAVAILABLE",
+        "WhatsApp photo preview is unavailable",
     )
 }
 fn media_unavailable() -> GatewayError {
@@ -1139,6 +1244,74 @@ mod tests {
         inbox_write(&path, &expired).unwrap();
         assert_eq!(a.prune_expired_media_references().unwrap(), 1);
         assert!(!path.exists());
+    }
+    #[test]
+    fn confirmation_preview_uses_only_matching_staged_source() {
+        let mut adapter = adapter();
+        let root = tempfile::tempdir().unwrap();
+        adapter.cache = root.path().join("attachment-cache");
+        let payload = json!({"phone_number_id":"123","message":{"from":"15555550101",
+            "id":"wamid.image.preview","timestamp":chrono::Utc::now().timestamp().to_string(),"type":"image",
+            "image":{"id":"2754859441498128","mime_type":"image/jpeg","sha256":"c".repeat(64)}}});
+        let inbound = adapter.normalize_inbound(payload.clone()).unwrap();
+        adapter
+            .stage_inbound_media(&payload, &inbound, None, "conv-preview")
+            .unwrap();
+        let id = inbound.attachments[0]["attachment_id"].as_str().unwrap();
+        let mut outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: inbound.chat_id.clone(),
+            text: "Save this photo?".into(),
+            attachments: vec![
+                json!({"artifact_id":id,"kind":"image","mime_type":"image/jpeg",
+                "metadata":{"whatsapp_inbound_confirmation_preview":true}}),
+            ],
+            timestamp: utc_now_iso(),
+            metadata: json!({"route_key":inbound.route_key,
+                "conversation_handle":"conv-preview",
+                "whatsapp_context_message_id":inbound.message_id})
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        assert_eq!(
+            adapter
+                .confirmation_preview_source(&outbound)
+                .unwrap()
+                .unwrap()
+                .provider_media_id,
+            "2754859441498128"
+        );
+        let prepared = PreparedOutbound {
+            provider_media_id: "uploaded-image-id".into(),
+            provider_client_id: None,
+            state: json!({"kind":"image"}),
+        };
+        let body = adapter.message_body(&outbound, Some(&prepared)).unwrap();
+        assert_eq!(body["type"], "image");
+        assert_eq!(body["image"]["caption"], "Save this photo?");
+        assert_eq!(body["image"]["id"], "uploaded-image-id");
+        assert_eq!(body["context"]["message_id"], "wamid.image.preview");
+
+        for (field, value) in [
+            ("route_key", json!("another-route")),
+            ("conversation_handle", json!("another-conversation")),
+            ("whatsapp_context_message_id", json!("wamid.other-image")),
+            ("navi_selection", json!({})),
+        ] {
+            let previous = outbound.metadata.insert(field.into(), value);
+            assert!(adapter.confirmation_preview_source(&outbound).is_err());
+            if let Some(previous) = previous {
+                outbound.metadata.insert(field.into(), previous);
+            } else {
+                outbound.metadata.remove(field);
+            }
+        }
+        outbound.chat_id = "15555550102".into();
+        assert!(adapter.confirmation_preview_source(&outbound).is_err());
+        outbound.chat_id = inbound.chat_id;
+        outbound.attachments[0]["mime_type"] = json!("image/webp");
+        assert!(adapter.confirmation_preview_source(&outbound).is_err());
     }
     #[test]
     fn media_url_and_file_signatures_are_restricted() {

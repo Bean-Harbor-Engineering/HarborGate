@@ -1,6 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 
@@ -223,6 +224,123 @@ async fn whatsapp_restart_blocks_previously_uploaded_media_after_unbinding() {
         .unwrap()
         .is_empty());
     server.abort();
+}
+
+struct PreviewDeliveryAdapter {
+    fail_upload: bool,
+    uploads: Arc<AtomicUsize>,
+    sent: Arc<Mutex<Vec<OutboundMessage>>>,
+}
+
+#[async_trait]
+impl PlatformAdapter for PreviewDeliveryAdapter {
+    fn name(&self) -> &str {
+        "whatsapp"
+    }
+    fn normalize_inbound(&self, _: Value) -> Result<InboundMessage, GatewayError> {
+        unreachable!()
+    }
+    async fn send_outbound(&self, _: OutboundMessage) -> Result<Value, GatewayError> {
+        unreachable!()
+    }
+    async fn prepare_outbound(
+        &self,
+        outbound: &OutboundMessage,
+    ) -> Result<Option<PreparedOutbound>, GatewayError> {
+        if outbound.attachments.is_empty() {
+            return Ok(None);
+        }
+        self.uploads.fetch_add(1, Ordering::SeqCst);
+        if self.fail_upload {
+            return Err(GatewayError::new(
+                StatusCode::BAD_GATEWAY,
+                "WHATSAPP_PREVIEW_UNAVAILABLE",
+                "WhatsApp photo preview is unavailable",
+            ));
+        }
+        Ok(Some(PreparedOutbound {
+            provider_media_id: "fixture-upload".into(),
+            provider_client_id: None,
+            state: json!({"kind":"image"}),
+        }))
+    }
+    async fn send_prepared_outbound(
+        &self,
+        outbound: OutboundMessage,
+        prepared: Option<&PreparedOutbound>,
+    ) -> Result<Value, GatewayError> {
+        assert_eq!(prepared.is_some(), !outbound.attachments.is_empty());
+        self.sent.lock().unwrap().push(outbound);
+        Ok(json!({"provider_message_id":"fixture-confirmation"}))
+    }
+    fn profile(&self) -> Value {
+        json!({"adapter_name":"whatsapp"})
+    }
+}
+
+#[tokio::test]
+async fn photo_preview_delivery_is_single_item_and_replay_does_not_resend() {
+    for fail_upload in [false, true] {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        let (_, calls, server) = fixture(&mut config).await;
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(PreviewDeliveryAdapter {
+            fail_upload,
+            uploads: uploads.clone(),
+            sent: sent.clone(),
+        });
+        let gateway = GatewayService::from_config(&config).unwrap();
+        let mut outbound = message(false);
+        outbound.text = "Save this photo?".into();
+        outbound.attachments = vec![json!({
+            "artifact_id":"wa_image_1234567890abcdef12345678",
+            "kind":"image",
+            "mime_type":"image/jpeg",
+            "metadata":{"whatsapp_inbound_confirmation_preview":true}
+        })];
+        outbound.metadata.insert(
+            "whatsapp_context_message_id".into(),
+            json!("wamid.source-image"),
+        );
+        let first = gateway
+            .deliver_outbound_items_guarded(
+                adapter.clone(),
+                outbound.clone(),
+                "preview-confirmation",
+                "same-plan",
+                None,
+            )
+            .await
+            .unwrap();
+        let replay = gateway
+            .deliver_outbound_items_guarded(
+                adapter,
+                outbound,
+                "preview-confirmation",
+                "same-plan",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["provider_message_id"], "fixture-confirmation");
+        assert_eq!(replay["provider_message_id"], "fixture-confirmation");
+        assert_eq!(replay["message_id"], "fixture-confirmation");
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].text, "Save this photo?");
+        assert_eq!(sent[0].attachments.is_empty(), fail_upload);
+        assert_eq!(
+            sent[0].metadata["whatsapp_context_message_id"],
+            "wamid.source-image"
+        );
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        server.abort();
+    }
 }
 
 #[tokio::test]

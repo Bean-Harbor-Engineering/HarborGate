@@ -487,7 +487,7 @@ impl GatewayService {
                         task_result.conversation_handle.as_deref().unwrap_or(""),
                     )?;
                 }
-                let attachment_candidates =
+                let mut attachment_candidates =
                     native_source_bound_attachments(adapter_name, &task_result.response_payload);
                 let reply_text = render_retrieval_reply(
                     &task_result.text,
@@ -495,6 +495,15 @@ impl GatewayService {
                     !attachment_candidates.is_empty(),
                     &self.public_origin,
                 );
+                if attachment_candidates.is_empty() {
+                    if let Some(preview) = library_photo_confirmation_preview(
+                        &inbound,
+                        task_result.active_frame.as_ref(),
+                        &reply_text,
+                    ) {
+                        attachment_candidates.push(preview);
+                    }
+                }
                 let mut next_metadata = session_metadata.clone();
                 next_metadata.insert("route_key".into(), json!(task_result.route_key));
                 next_metadata.insert("session_id".into(), json!(resolved_session_id));
@@ -1597,7 +1606,8 @@ impl GatewayService {
             {
                 metadata.insert("delivery_item_key".into(), json!(item_key));
             }
-            let fallback_outbound = native_video_file_fallback(&item_outbound);
+            let fallback_outbound = native_video_file_fallback(&item_outbound)
+                .or_else(|| native_preview_text_fallback(&item_outbound));
             let native_is_unsupported = claim
                 .pointer("/item/stages/native/status")
                 .and_then(Value::as_str)
@@ -1643,7 +1653,9 @@ impl GatewayService {
                     .await;
                 match (native_result, fallback_outbound) {
                     (Err(native_error), Some(fallback_outbound))
-                        if should_fallback_to_file(&native_error) =>
+                        if should_fallback_to_file(&native_error)
+                            || (native_prepared.is_none()
+                                && native_error.code == "WHATSAPP_PREVIEW_UNAVAILABLE") =>
                     {
                         let (result, prepared) = self
                             .send_delivery_stage(
@@ -2060,6 +2072,20 @@ fn split_outbound_items(
 ) -> Result<Vec<(String, String, String, OutboundMessage)>, GatewayError> {
     let mut items = Vec::new();
     let mut artifact_ids = HashSet::new();
+    if outbound.platform == "whatsapp"
+        && outbound.attachments.len() == 1
+        && outbound.attachments[0]["metadata"]["whatsapp_inbound_confirmation_preview"] == true
+    {
+        let artifact_id = delivery_artifact_id(&outbound.attachments[0])
+            .ok_or_else(|| GatewayError::validation("Invalid WhatsApp photo preview"))?;
+        items.push((
+            attachment_item_identity(&artifact_id),
+            artifact_id,
+            "image".to_string(),
+            outbound,
+        ));
+        return Ok(items);
+    }
     if !outbound.text.trim().is_empty() {
         let mut text_outbound = outbound.clone();
         text_outbound.attachments.clear();
@@ -2143,6 +2169,18 @@ fn native_video_file_fallback(outbound: &OutboundMessage) -> Option<OutboundMess
         .metadata
         .insert("native_attachment_fallback_used".into(), json!(true));
     Some(fallback)
+}
+
+fn native_preview_text_fallback(outbound: &OutboundMessage) -> Option<OutboundMessage> {
+    (outbound.platform == "whatsapp"
+        && outbound.attachments.len() == 1
+        && outbound.attachments[0]["metadata"]["whatsapp_inbound_confirmation_preview"] == true
+        && !outbound.text.trim().is_empty())
+    .then(|| {
+        let mut fallback = outbound.clone();
+        fallback.attachments.clear();
+        fallback
+    })
 }
 
 fn should_fallback_to_file(error: &GatewayError) -> bool {
@@ -2282,6 +2320,30 @@ fn library_photo_confirmation_context<'a>(
             .and_then(Value::as_str)
             == Some("library.photo_confirmation"))
     .then_some(inbound.message_id.as_str())
+}
+
+fn library_photo_confirmation_preview(
+    inbound: &InboundMessage,
+    active_frame: Option<&Value>,
+    reply_text: &str,
+) -> Option<Value> {
+    library_photo_confirmation_context(inbound, active_frame)?;
+    if reply_text.trim().is_empty() || reply_text.chars().count() > 1024 {
+        return None;
+    }
+    let photo = &inbound.attachments[0];
+    if !matches!(
+        photo["mime_type"].as_str(),
+        Some("image/jpeg" | "image/png")
+    ) {
+        return None;
+    }
+    Some(json!({
+        "artifact_id": photo["attachment_id"],
+        "kind": "image",
+        "mime_type": photo["mime_type"],
+        "metadata": {"whatsapp_inbound_confirmation_preview": true},
+    }))
 }
 
 fn gateway_turn_to_inbound(payload: &Value) -> Result<InboundMessage, GatewayError> {
@@ -3068,6 +3130,38 @@ mod tests {
         assert_eq!(
             library_photo_confirmation_context(&inbound, Some(&frame)),
             Some("wamid.image-1")
+        );
+        inbound.attachments[0]["attachment_id"] = json!("wa_image_1234567890abcdef12345678");
+        inbound.attachments[0]["mime_type"] = json!("image/jpeg");
+        let preview =
+            library_photo_confirmation_preview(&inbound, Some(&frame), "Save this photo?")
+                .expect("JPEG confirmation has a preview");
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: inbound.chat_id.clone(),
+            text: "Save this photo?".into(),
+            attachments: vec![preview],
+            timestamp: crate::models::utc_now_iso(),
+            metadata: json!({"whatsapp_context_message_id":inbound.message_id})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let items = split_outbound_items(outbound.clone()).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].3.text, "Save this photo?");
+        assert_eq!(items[0].3.attachments.len(), 1);
+        let fallback = native_preview_text_fallback(&outbound).unwrap();
+        assert!(fallback.attachments.is_empty());
+        assert_eq!(
+            fallback.metadata["whatsapp_context_message_id"],
+            "wamid.image-1"
+        );
+        inbound.attachments[0]["mime_type"] = json!("image/webp");
+        assert!(library_photo_confirmation_preview(&inbound, Some(&frame), "Save?").is_none());
+        inbound.attachments[0]["mime_type"] = json!("image/png");
+        assert!(
+            library_photo_confirmation_preview(&inbound, Some(&frame), &"x".repeat(1025)).is_none()
         );
         assert_eq!(library_photo_confirmation_context(&inbound, None), None);
         assert_eq!(
