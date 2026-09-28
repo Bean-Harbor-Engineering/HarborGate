@@ -6,8 +6,8 @@ artifact="$1"
 [[ -f "$artifact" ]] || { echo "error: package not found: $artifact" >&2; exit 2; }
 
 depends="$(dpkg-deb --field "$artifact" Depends)"
-grep -Fq 'harboros-system (>= 0.1.0+harbornavi.k3.evt1)' <<<"$depends"
-grep -Fq 'harboros-system (<< 0.2)' <<<"$depends"
+grep -Eq '(^|, )harboros-system(,|$)' <<<"$depends"
+! grep -Eq 'harboros-system[[:space:]]*\(' <<<"$depends"
 
 [[ ! -e /etc/harboros/service-auth ]] || {
   echo "error: lifecycle fixture requires a disposable container without service credentials" >&2
@@ -22,7 +22,7 @@ trap 'rm -rf -- "$fixture"; rm -f -- /run/harboros/home.env' EXIT
 install -d "$fixture/system/DEBIAN" "$fixture/system/usr/lib/systemd/system"
 cat > "$fixture/system/DEBIAN/control" <<'EOF'
 Package: harboros-system
-Version: 0.1.0+harbornavi.k3.evt1
+Version: 1.0.0+ci
 Architecture: all
 Maintainer: Harbor package test
 Description: Test-only dependency fixture for HarborGate lifecycle CI

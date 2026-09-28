@@ -1216,6 +1216,11 @@ fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
         assert!(!k3_postinst.contains(&format!("ensure-harborbeacon-token-env {mode}")));
     }
     let k3_control = fs::read_to_string(root.join("debian/harbornavi-k3/control")).unwrap();
+    assert!(k3_control
+        .lines()
+        .any(|line| line.starts_with("Depends: harboros-system, ")));
+    assert!(!k3_control.contains("harboros-system ("));
+    assert!(!k3_control.contains("Breaks: harboros-system"));
     assert!(k3_control.contains("util-linux"));
     assert!(k3_control.contains("Provides: harboros-service-auth-abi (= 1)"));
     assert!(ci.contains("Run root-owned service-auth integration tests"));
