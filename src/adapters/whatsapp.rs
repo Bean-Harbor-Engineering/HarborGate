@@ -668,7 +668,7 @@ impl PlatformAdapter for WhatsAppAdapter {
                 .unwrap_or("");
             if media_id.is_empty()
                 || !valid_media_id(media_id)
-                || !["image/jpeg", "image/png"].contains(&mime_type)
+                || image_filename(mime_type).is_none()
                 || sha256.len() != 64
                 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
@@ -725,11 +725,9 @@ impl PlatformAdapter for WhatsAppAdapter {
         }
         let item = &outbound.attachments[0];
         let mime = item["mime_type"].as_str().unwrap_or("");
-        if !["image/jpeg", "image/png"].contains(&mime) {
-            return Err(GatewayError::validation(
-                "WhatsApp supports JPEG or PNG image replies",
-            ));
-        }
+        let filename = image_filename(mime).ok_or_else(|| {
+            GatewayError::validation("WhatsApp supports JPEG, PNG, or WebP image replies")
+        })?;
         let path = Path::new(item["path"].as_str().unwrap_or(""));
         let relative = path.strip_prefix(&self.cache).map_err(|_| denied())?;
         if relative
@@ -756,11 +754,7 @@ impl PlatformAdapter for WhatsAppAdapter {
         let form = Form::new().text("messaging_product", "whatsapp").part(
             "file",
             Part::bytes(bytes)
-                .file_name(if mime == "image/png" {
-                    "snapshot.png"
-                } else {
-                    "snapshot.jpg"
-                })
+                .file_name(filename)
                 .mime_str(mime)
                 .map_err(|_| denied())?,
         );
@@ -878,10 +872,19 @@ fn trusted_media_url(value: &str) -> Option<Url> {
         && url.fragment().is_none())
     .then_some(url)
 }
+fn image_filename(mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "image/jpeg" => Some("snapshot.jpg"),
+        "image/png" => Some("snapshot.png"),
+        "image/webp" => Some("snapshot.webp"),
+        _ => None,
+    }
+}
 fn image_signature_matches(mime_type: &str, bytes: &[u8]) -> bool {
     match mime_type {
         "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
         "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
         _ => false,
     }
 }
@@ -1048,6 +1051,51 @@ mod tests {
         }
     }
     #[test]
+    fn signed_webp_image_preserves_media_reference_and_validates_bytes() {
+        let a = adapter();
+        let bytes = b"RIFF\x08\x00\x00\x00WEBPVP8 ";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let body = json!({"object":"whatsapp_business_account","entry":[{"changes":[{"field":"messages","value":{
+            "metadata":{"phone_number_id":"123"},"messages":[{"from":"15555550101","id":"wamid.webp.1",
+            "timestamp":"1700000000","type":"image","image":{"caption":"门口照片","id":"2754859441498128",
+            "mime_type":"image/webp","sha256":sha256}}]}}]}]}).to_string().into_bytes();
+        let payload = a.verified_messages(&body, &sign(&body)).unwrap().remove(0);
+        let inbound = a.normalize_inbound(payload).unwrap();
+        assert_eq!(inbound.text, "门口照片");
+        assert_eq!(inbound.attachments[0]["mime_type"], "image/webp");
+        assert_eq!(inbound.attachments[0]["metadata"]["sha256"], sha256);
+        assert_eq!(image_filename("image/webp"), Some("snapshot.webp"));
+        let reference = InboundMediaReference {
+            attachment_id: inbound.attachments[0]["attachment_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+            provider_media_id: "2754859441498128".into(),
+            mime_type: "image/webp".into(),
+            sha256,
+            recipient: inbound.chat_id,
+            route_key: inbound.route_key,
+            conversation_handle: "conv-webp".into(),
+            selection: None,
+            expires_at: i64::MAX,
+        };
+        assert!(image_bytes_match(
+            &reference,
+            &json!({"file_size":bytes.len()}),
+            bytes
+        ));
+        assert!(!image_bytes_match(
+            &reference,
+            &json!({"file_size":bytes.len()+1}),
+            bytes
+        ));
+        assert!(!image_bytes_match(
+            &reference,
+            &json!({"file_size":bytes.len()}),
+            b"RIFF\x08\x00\x00\x00WAVEVP8 ",
+        ));
+    }
+    #[test]
     fn media_reference_is_private_idempotent_and_expires() {
         let mut a = adapter();
         let root = tempfile::tempdir().unwrap();
@@ -1098,6 +1146,15 @@ mod tests {
             "image/png",
             b"\x89PNG\r\n\x1a\nrest"
         ));
+        assert!(image_signature_matches(
+            "image/webp",
+            b"RIFF\x08\0\0\0WEBPVP8 "
+        ));
+        assert!(!image_signature_matches(
+            "image/webp",
+            b"RIFF\x08\0\0\0WAVE"
+        ));
+        assert!(!image_signature_matches("image/webp", b"RIFF\x08\0\0\0WEB"));
         assert!(!image_signature_matches("image/png", b"<svg></svg>"));
         let bytes = [0xff, 0xd8, 0xff, 0xd9];
         let reference = InboundMediaReference {
