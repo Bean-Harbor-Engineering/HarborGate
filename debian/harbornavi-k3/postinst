@@ -2,7 +2,32 @@
 set -e
 
 /usr/lib/harborgate/ensure-data-layout
-/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env prepare
+
+generic_firstboot_pending() {
+  # Only a prepared offline image may defer per-device credential creation.
+  # The marker remains after boot, so initialized profiles must never bypass
+  # the normal credential validation below.
+  [ "${SYSTEMD_OFFLINE:-}" = 1 ] || return 1
+  marker=/etc/harboros/engineering-zigbee-firstboot
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  [ "$(stat -c '%u:%g:%a:%s' "$marker")" = 0:0:644:0 ] || return 1
+  for path in /etc/harboros/engineering-setup.json /etc/harboros/setup.json \
+      /etc/harborlink/ha-bridge.json /data/harboros/factory/setup-network.json \
+      /etc/harboros/service-auth/gate-to-beacon.send \
+      /etc/harboros/service-auth/gate-to-beacon.accept-current \
+      /etc/harboros/service-auth/beacon-to-gate.send \
+      /etc/harboros/service-auth/beacon-to-gate.accept-current \
+      /etc/harboros/service-auth/.credential-transaction; do
+    [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+  done
+  return 0
+}
+
+if generic_firstboot_pending; then
+  echo "Deferring per-device service credentials to engineering first boot"
+else
+  /usr/lib/harboros-im-gate/ensure-harborbeacon-token-env prepare
+fi
 
 if command -v deb-systemd-helper >/dev/null 2>&1; then
   deb-systemd-helper unmask harboros-im-gate.service >/dev/null || true
