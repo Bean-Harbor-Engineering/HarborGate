@@ -66,6 +66,7 @@ def test_k3_service_keeps_device_sessions_in_the_persistent_writable_data_root()
     assert "Environment=HARBORGATE_RUNTIME_PROFILE=k3" in service
     assert "Requires=harboros-bootstrap.service" in service
     assert "After=network-online.target harboros-bootstrap.service" in service
+    assert "ConditionPathExists=/run/harboros/home.env" in service.split("[Service]", 1)[0]
     assert "EnvironmentFile=/run/harboros/home.env" in service
     assert "EnvironmentFile=-/run/harboros/home.env" not in service
     assert "Requires=harboros-service-auth-recovery.service" in service
