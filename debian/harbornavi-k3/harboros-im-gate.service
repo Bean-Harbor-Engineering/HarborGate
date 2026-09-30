@@ -6,6 +6,7 @@ Requires=harboros-bootstrap.service
 Requires=harboros-service-auth-recovery.service
 After=harboros-service-auth-recovery.service
 RequiresMountsFor=/data
+ConditionPathExists=/run/harboros/home.env
 
 [Service]
 Type=simple
