@@ -2,7 +2,9 @@ use crate::adapters::feishu::FeishuAdapter;
 use crate::adapters::feishu_mail::FeishuMailAdapter;
 use crate::adapters::webhook::WebhookAdapter;
 use crate::adapters::weixin::WeixinAdapter;
-use crate::adapters::whatsapp::{WhatsAppAdapter, WhatsAppConfig};
+use crate::adapters::whatsapp::{
+    InboundMediaBytes, InboundMediaReference, WhatsAppAdapter, WhatsAppConfig,
+};
 use crate::adapters::{PlatformAdapter, PreparedOutbound};
 use crate::cloud_relay::CloudRelayClient;
 use crate::config::AppConfig;
@@ -25,6 +27,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -33,6 +36,9 @@ use uuid::Uuid;
 #[cfg(test)]
 #[path = "whatsapp_delivery_tests.rs"]
 mod whatsapp_delivery_tests;
+#[cfg(test)]
+#[path = "whatsapp_media_tests.rs"]
+mod whatsapp_media_tests;
 
 #[cfg(test)]
 #[path = "gateway_fleet_tests.rs"]
@@ -415,6 +421,8 @@ impl GatewayService {
         let adapter = self
             .adapter(adapter_name)
             .ok_or_else(|| GatewayError::validation(format!("Unknown adapter: {adapter_name}")))?;
+        let media_payload = (adapter_name == "whatsapp" && payload["message"]["type"] == "image")
+            .then(|| payload.clone());
         let inbound = adapter.normalize_inbound(payload)?;
         let selection = if inbound.platform == "whatsapp" {
             if let Some(fleet) = &self.fleet {
@@ -474,7 +482,15 @@ impl GatewayService {
         let (reply_text, outbound_attachments, mut outbound_metadata, next_metadata) =
             if let Some(task_client) = &selected_client {
                 let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
-                let attachment_candidates =
+                if let Some(media_payload) = &media_payload {
+                    self.whatsapp_adapter.stage_inbound_media(
+                        media_payload,
+                        &inbound,
+                        selection.as_ref(),
+                        task_result.conversation_handle.as_deref().unwrap_or(""),
+                    )?;
+                }
+                let mut attachment_candidates =
                     native_source_bound_attachments(adapter_name, &task_result.response_payload);
                 let reply_text = render_retrieval_reply(
                     &task_result.text,
@@ -482,6 +498,15 @@ impl GatewayService {
                     !attachment_candidates.is_empty(),
                     &self.public_origin,
                 );
+                if attachment_candidates.is_empty() {
+                    if let Some(preview) = library_photo_confirmation_preview(
+                        &inbound,
+                        task_result.active_frame.as_ref(),
+                        &reply_text,
+                    ) {
+                        attachment_candidates.push(preview);
+                    }
+                }
                 let mut next_metadata = session_metadata.clone();
                 next_metadata.insert("route_key".into(), json!(task_result.route_key));
                 next_metadata.insert("session_id".into(), json!(resolved_session_id));
@@ -523,6 +548,11 @@ impl GatewayService {
                     "conversation_handle".into(),
                     json!(task_result.conversation_handle),
                 );
+                if let Some(message_id) =
+                    library_photo_confirmation_context(&inbound, task_result.active_frame.as_ref())
+                {
+                    metadata.insert("whatsapp_context_message_id".into(), json!(message_id));
+                }
                 metadata.insert(
                     "active_frame".into(),
                     task_result.active_frame.unwrap_or(Value::Null),
@@ -536,9 +566,19 @@ impl GatewayService {
                     "native_attachment_count".into(),
                     json!(attachment_candidates.len()),
                 );
+                if adapter_name == "whatsapp" {
+                    let source_refs = source_revalidation_refs(&task_result.response_payload)?;
+                    metadata.insert("source_auth_schema".into(), json!(1));
+                    metadata.insert("source_revalidation_refs".into(), json!(source_refs));
+                }
                 metadata.insert("native_attachment_materialize_failed".into(), json!(0));
                 (reply_text, attachment_candidates, metadata, next_metadata)
             } else {
+                if media_payload.is_some() {
+                    return Err(GatewayError::infrastructure(
+                        "WhatsApp image intake requires HarborBeacon",
+                    ));
+                }
                 let mut next_metadata = session_metadata.clone();
                 next_metadata.insert("route_key".into(), json!(resolved_route_key));
                 next_metadata.insert("session_id".into(), json!(resolved_session_id));
@@ -626,6 +666,87 @@ impl GatewayService {
             None,
         )
         .await
+    }
+
+    pub(crate) async fn pull_whatsapp_media(
+        &self,
+        attachment_id: &str,
+        route_key: &str,
+        hub_id: &str,
+    ) -> Result<InboundMediaBytes, GatewayError> {
+        self.pull_whatsapp_media_with(attachment_id, route_key, hub_id, |record| async move {
+            self.whatsapp_adapter.download_inbound_media(&record).await
+        })
+        .await
+    }
+
+    async fn pull_whatsapp_media_with<F, Fut>(
+        &self,
+        attachment_id: &str,
+        route_key: &str,
+        hub_id: &str,
+        download: F,
+    ) -> Result<InboundMediaBytes, GatewayError>
+    where
+        F: FnOnce(InboundMediaReference) -> Fut,
+        Fut: Future<Output = Result<InboundMediaBytes, GatewayError>>,
+    {
+        let record = self
+            .whatsapp_adapter
+            .inbound_media_reference(attachment_id)?;
+        let denied = || {
+            GatewayError::new(
+                StatusCode::FORBIDDEN,
+                "WHATSAPP_MEDIA_NOT_ALLOWED",
+                "WhatsApp image route is no longer authorized",
+            )
+        };
+        if route_key.is_empty() || route_key != record.route_key {
+            return Err(denied());
+        }
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("route_key".into(), json!(record.route_key));
+        metadata.insert(
+            "conversation_handle".into(),
+            json!(record.conversation_handle),
+        );
+        let client = match (&self.fleet, &record.selection) {
+            (Some(fleet), Some(selection)) if hub_id == selection.hub_id => {
+                metadata.insert("navi_selection".into(), json!(selection));
+                let outbound = OutboundMessage {
+                    platform: "whatsapp".into(),
+                    chat_id: record.recipient.clone(),
+                    text: String::new(),
+                    attachments: vec![json!({"kind":"image"})],
+                    timestamp: crate::models::utc_now_iso(),
+                    metadata: metadata.clone(),
+                };
+                fleet.check(&outbound)?;
+                HarborBeaconTaskClient::from_cloud_relay(
+                    fleet.relay.with_hub_identity(&selection.hub_identity)?,
+                    &selection.hub_id,
+                )?
+            }
+            (None, None) if hub_id == "local" => self.task_client.clone().ok_or_else(denied)?,
+            _ => return Err(denied()),
+        };
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: record.recipient.clone(),
+            text: String::new(),
+            attachments: vec![json!({"kind":"image"})],
+            timestamp: crate::models::utc_now_iso(),
+            metadata,
+        };
+        client.authorize_whatsapp_delivery(&outbound).await?;
+        let bytes = download(record.clone()).await?;
+        client.authorize_whatsapp_delivery(&outbound).await?;
+        if let (Some(fleet), Some(_)) = (&self.fleet, &record.selection) {
+            fleet.check(&outbound)?;
+        }
+        self.whatsapp_adapter
+            .inbound_media_reference(attachment_id)?;
+        Ok(bytes)
     }
 
     pub async fn handle_gateway_turn(&self, payload: Value) -> Result<Value, GatewayError> {
@@ -1018,6 +1139,17 @@ impl GatewayService {
         outbound: &OutboundMessage,
     ) -> Result<(), GatewayError> {
         let result: Result<(), GatewayError> = async {
+            if outbound.platform == "whatsapp"
+                && outbound.metadata.get("source").and_then(Value::as_str) == Some("harborbeacon")
+                && (outbound.metadata.get("source_auth_schema") != Some(&json!(1))
+                    || !outbound.metadata.contains_key("source_revalidation_refs"))
+            {
+                return Err(GatewayError::new(
+                    StatusCode::FORBIDDEN,
+                    "IM_DELIVERY_NOT_ALLOWED",
+                    "Queued WhatsApp reply lacks source authorization metadata",
+                ));
+            }
             self.authorize_camera_delivery(outbound).await?;
             if outbound.platform == "whatsapp" {
                 let client = self.outbound_task_client(outbound)?;
@@ -1508,7 +1640,8 @@ impl GatewayService {
             {
                 metadata.insert("delivery_item_key".into(), json!(item_key));
             }
-            let fallback_outbound = native_video_file_fallback(&item_outbound);
+            let fallback_outbound = native_video_file_fallback(&item_outbound)
+                .or_else(|| native_preview_text_fallback(&item_outbound));
             let native_is_unsupported = claim
                 .pointer("/item/stages/native/status")
                 .and_then(Value::as_str)
@@ -1554,7 +1687,9 @@ impl GatewayService {
                     .await;
                 match (native_result, fallback_outbound) {
                     (Err(native_error), Some(fallback_outbound))
-                        if should_fallback_to_file(&native_error) =>
+                        if should_fallback_to_file(&native_error)
+                            || (native_prepared.is_none()
+                                && native_error.code == "WHATSAPP_PREVIEW_UNAVAILABLE") =>
                     {
                         let (result, prepared) = self
                             .send_delivery_stage(
@@ -1971,6 +2106,20 @@ fn split_outbound_items(
 ) -> Result<Vec<(String, String, String, OutboundMessage)>, GatewayError> {
     let mut items = Vec::new();
     let mut artifact_ids = HashSet::new();
+    if outbound.platform == "whatsapp"
+        && outbound.attachments.len() == 1
+        && outbound.attachments[0]["metadata"]["whatsapp_inbound_confirmation_preview"] == true
+    {
+        let artifact_id = delivery_artifact_id(&outbound.attachments[0])
+            .ok_or_else(|| GatewayError::validation("Invalid WhatsApp photo preview"))?;
+        items.push((
+            attachment_item_identity(&artifact_id),
+            artifact_id,
+            "image".to_string(),
+            outbound,
+        ));
+        return Ok(items);
+    }
     if !outbound.text.trim().is_empty() {
         let mut text_outbound = outbound.clone();
         text_outbound.attachments.clear();
@@ -2054,6 +2203,18 @@ fn native_video_file_fallback(outbound: &OutboundMessage) -> Option<OutboundMess
         .metadata
         .insert("native_attachment_fallback_used".into(), json!(true));
     Some(fallback)
+}
+
+fn native_preview_text_fallback(outbound: &OutboundMessage) -> Option<OutboundMessage> {
+    (outbound.platform == "whatsapp"
+        && outbound.attachments.len() == 1
+        && outbound.attachments[0]["metadata"]["whatsapp_inbound_confirmation_preview"] == true
+        && !outbound.text.trim().is_empty())
+    .then(|| {
+        let mut fallback = outbound.clone();
+        fallback.attachments.clear();
+        fallback
+    })
 }
 
 fn should_fallback_to_file(error: &GatewayError) -> bool {
@@ -2172,6 +2333,51 @@ fn sweep_expired_attachment_cache(
         }
     }
     Ok(())
+}
+
+fn library_photo_confirmation_context<'a>(
+    inbound: &'a InboundMessage,
+    active_frame: Option<&Value>,
+) -> Option<&'a str> {
+    (inbound.platform == "whatsapp"
+        && !inbound.message_id.is_empty()
+        && inbound.message_id.len() <= 512
+        && inbound
+            .message_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+        && inbound.attachments.len() == 1
+        && inbound.attachments[0]["type"] == "image"
+        && inbound.attachments[0]["metadata"]["provider"] == "whatsapp"
+        && active_frame
+            .and_then(|frame| frame.get("kind"))
+            .and_then(Value::as_str)
+            == Some("library.photo_confirmation"))
+    .then_some(inbound.message_id.as_str())
+}
+
+fn library_photo_confirmation_preview(
+    inbound: &InboundMessage,
+    active_frame: Option<&Value>,
+    reply_text: &str,
+) -> Option<Value> {
+    library_photo_confirmation_context(inbound, active_frame)?;
+    if reply_text.trim().is_empty() || reply_text.chars().count() > 1024 {
+        return None;
+    }
+    let photo = &inbound.attachments[0];
+    if !matches!(
+        photo["mime_type"].as_str(),
+        Some("image/jpeg" | "image/png" | "image/webp")
+    ) {
+        return None;
+    }
+    Some(json!({
+        "artifact_id": photo["attachment_id"],
+        "kind": "image",
+        "mime_type": photo["mime_type"],
+        "metadata": {"whatsapp_inbound_confirmation_preview": true},
+    }))
 }
 
 fn gateway_turn_to_inbound(payload: &Value) -> Result<InboundMessage, GatewayError> {
@@ -2495,6 +2701,32 @@ fn artifact_candidates(response_payload: &Value) -> Vec<Value> {
         .unwrap_or_default()
         .into_iter()
         .filter(|value| value.is_object())
+        .collect()
+}
+
+fn source_revalidation_refs(response_payload: &Value) -> Result<Vec<String>, GatewayError> {
+    let references = artifact_candidates(response_payload)
+        .into_iter()
+        .filter(|artifact| artifact["kind"] == "source_reference")
+        .take(6)
+        .collect::<Vec<_>>();
+    if references.len() > 5 {
+        return Err(GatewayError::infrastructure(
+            "Too many source references in reply",
+        ));
+    }
+    references
+        .iter()
+        .map(|artifact| {
+            artifact
+                .pointer("/metadata/delivery_auth_ref")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty() && token.len() <= 2048)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    GatewayError::infrastructure("Source reference authorization is unavailable")
+                })
+        })
         .collect()
 }
 
@@ -2942,6 +3174,72 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn only_library_photo_confirmation_replies_to_inbound_image() {
+        let mut inbound: InboundMessage = serde_json::from_value(json!({
+            "platform": "whatsapp",
+            "chat_id": "15555550101",
+            "user_id": "15555550101",
+            "text": "",
+            "message_id": "wamid.image-1",
+            "attachments": [{"type":"image","metadata":{"provider":"whatsapp"}}]
+        }))
+        .unwrap();
+        let frame = json!({"kind":"library.photo_confirmation"});
+        assert_eq!(
+            library_photo_confirmation_context(&inbound, Some(&frame)),
+            Some("wamid.image-1")
+        );
+        inbound.attachments[0]["attachment_id"] = json!("wa_image_1234567890abcdef12345678");
+        inbound.attachments[0]["mime_type"] = json!("image/jpeg");
+        let preview =
+            library_photo_confirmation_preview(&inbound, Some(&frame), "Save this photo?")
+                .expect("JPEG confirmation has a preview");
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: inbound.chat_id.clone(),
+            text: "Save this photo?".into(),
+            attachments: vec![preview],
+            timestamp: crate::models::utc_now_iso(),
+            metadata: json!({"whatsapp_context_message_id":inbound.message_id})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let items = split_outbound_items(outbound.clone()).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].3.text, "Save this photo?");
+        assert_eq!(items[0].3.attachments.len(), 1);
+        let fallback = native_preview_text_fallback(&outbound).unwrap();
+        assert!(fallback.attachments.is_empty());
+        assert_eq!(
+            fallback.metadata["whatsapp_context_message_id"],
+            "wamid.image-1"
+        );
+        inbound.attachments[0]["mime_type"] = json!("image/webp");
+        assert!(library_photo_confirmation_preview(&inbound, Some(&frame), "Save?").is_some());
+        inbound.attachments[0]["mime_type"] = json!("image/png");
+        assert!(
+            library_photo_confirmation_preview(&inbound, Some(&frame), &"x".repeat(1025)).is_none()
+        );
+        assert_eq!(library_photo_confirmation_context(&inbound, None), None);
+        assert_eq!(
+            library_photo_confirmation_context(&inbound, Some(&json!({"kind":"other"}))),
+            None
+        );
+        inbound.attachments.clear();
+        assert_eq!(
+            library_photo_confirmation_context(&inbound, Some(&frame)),
+            None
+        );
+        inbound.attachments = vec![json!({"type":"image","metadata":{"provider":"whatsapp"}})];
+        inbound.message_id = "bad\nmessage-id".into();
+        assert_eq!(
+            library_photo_confirmation_context(&inbound, Some(&frame)),
+            None
+        );
+    }
 
     async fn camera_authorization_fixture(
         config: &mut AppConfig,
@@ -3840,6 +4138,211 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read(corrupt).unwrap(), original);
+    }
+
+    #[test]
+    fn text_only_source_references_require_opaque_delivery_tokens() {
+        let response = json!({"artifacts":[
+            {"kind":"source_reference","label":"receipt","metadata":{"delivery_auth_ref":"opaque-library"}},
+            {"kind":"source_reference","label":"camera","metadata":{"delivery_auth_ref":"opaque-timeline"}}
+        ]});
+        assert_eq!(
+            source_revalidation_refs(&response).unwrap(),
+            ["opaque-library", "opaque-timeline"]
+        );
+        let rendered =
+            render_retrieval_reply("The answer cites both sources", &response, false, "");
+        assert!(!rendered.contains("opaque-library"));
+        assert!(!rendered.contains("opaque-timeline"));
+        let missing = json!({"artifacts":[{"kind":"source_reference","label":"receipt"}]});
+        assert!(source_revalidation_refs(&missing).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_queued_beacon_reply_is_denied_after_restart() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url.clear();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(RetryOnceAdapter {
+            attempts: sends.clone(),
+        });
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: "15555550101".into(),
+            text: "old answer cites a private photo".into(),
+            attachments: vec![],
+            metadata: json!({"source":"harborbeacon","adapter":"retry_once",
+                "conversation_handle":"old-handle","route_key":"fixture-route"})
+            .as_object()
+            .unwrap()
+            .clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let gateway = GatewayService::from_config(&config).unwrap();
+        let items = split_outbound_items(outbound.clone()).unwrap();
+        let planned_items = items
+            .iter()
+            .map(|(identity, artifact_id, kind, item)| DeliveryPlanItem {
+                item_key: delivery_item_key("legacy-source", identity),
+                artifact_id: artifact_id.clone(),
+                kind: kind.clone(),
+                planned_outbound: serde_json::to_value(item).unwrap(),
+                materialization_required: false,
+            })
+            .collect();
+        gateway
+            .store
+            .persist_delivery_plan(
+                "legacy-source",
+                "same-plan",
+                serde_json::to_value(&outbound).unwrap(),
+                planned_items,
+            )
+            .unwrap();
+        drop(gateway);
+        let mut restarted = GatewayService::from_config(&config).unwrap();
+        restarted.adapters.insert("retry_once".into(), adapter);
+        assert_eq!(restarted.retry_pending_deliveries().await.unwrap(), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        assert!(restarted
+            .store
+            .retryable_delivery_plans()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_refs_are_rechecked_on_valid_retry_after_restart() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_token = "fixture-service-token".into();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.harborbeacon_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/im/whatsapp/delivery-authorization",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let observed = observed.clone();
+                    async move {
+                        assert_eq!(
+                            body["source_refs"],
+                            json!(["opaque-library", "opaque-timeline"])
+                        );
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"allowed":true}))
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(RetryOnceAdapter {
+            attempts: attempts.clone(),
+        });
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: "15555550101".into(),
+            text: "answer with two citations".into(),
+            attachments: vec![],
+            metadata: json!({"source":"harborbeacon","adapter":"retry_once","source_auth_schema":1,
+                "source_revalidation_refs":["opaque-library","opaque-timeline"],
+                "conversation_handle":"fixture-handle","route_key":"fixture-route"})
+            .as_object()
+            .unwrap()
+            .clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let gateway = GatewayService::from_config(&config).unwrap();
+        assert!(gateway
+            .deliver_outbound_items_guarded(
+                adapter.clone(),
+                outbound.clone(),
+                "source-retry",
+                "same-plan",
+                None
+            )
+            .await
+            .is_err());
+        drop(gateway);
+        let mut restarted = GatewayService::from_config(&config).unwrap();
+        restarted.adapters.insert("retry_once".into(), adapter);
+        assert_eq!(restarted.retry_pending_deliveries().await.unwrap(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(checks.load(Ordering::SeqCst) >= 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn revoked_source_ref_blocks_queued_text_on_retry() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_token = "fixture-service-token".into();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.harborbeacon_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let authorized = Arc::new(AtomicUsize::new(1));
+        let current = authorized.clone();
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/im/whatsapp/delivery-authorization",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let current = current.clone();
+                    async move {
+                        assert_eq!(body["source_refs"], json!(["opaque-library"]));
+                        if current.load(Ordering::SeqCst) == 1 {
+                            (StatusCode::OK, axum::Json(json!({"allowed":true})))
+                        } else {
+                            (StatusCode::FORBIDDEN, axum::Json(json!({"allowed":false})))
+                        }
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(RetryOnceAdapter {
+            attempts: attempts.clone(),
+        });
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: "15555550101".into(),
+            text: "private OCR text".into(),
+            attachments: vec![],
+            metadata: json!({"source":"harborbeacon","adapter":"retry_once",
+                "source_auth_schema":1,"source_revalidation_refs":["opaque-library"],
+                "conversation_handle":"fixture-handle","route_key":"fixture-route"})
+            .as_object()
+            .unwrap()
+            .clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let gateway = GatewayService::from_config(&config).unwrap();
+        assert!(gateway
+            .deliver_outbound_items_guarded(
+                adapter.clone(),
+                outbound,
+                "revoked-source-retry",
+                "same-plan",
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        drop(gateway);
+        authorized.store(0, Ordering::SeqCst);
+        let mut restarted = GatewayService::from_config(&config).unwrap();
+        restarted.adapters.insert("retry_once".into(), adapter);
+        assert_eq!(restarted.retry_pending_deliveries().await.unwrap(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]

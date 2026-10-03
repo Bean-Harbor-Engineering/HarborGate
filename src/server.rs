@@ -13,10 +13,10 @@ use crate::setup::SetupPortalService;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{
-    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
+    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, SET_COOKIE},
     HeaderMap, HeaderValue, Method, StatusCode,
 };
-use axum::response::{Html, IntoResponse, Redirect};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use reqwest::Client;
@@ -122,6 +122,14 @@ pub fn router(state: AppState) -> Router {
             post(notification_delivery),
         )
         .route("/api/notifications/deliveries", post(notification_delivery))
+        .route(
+            "/api/im/whatsapp/media/{attachment_id}",
+            get(whatsapp_media),
+        )
+        .route(
+            "/api/harbor-gate/api/im/whatsapp/media/{attachment_id}",
+            get(whatsapp_media),
+        )
         .route("/api/harbor-gate/setup", get(prefixed_feishu_setup_page))
         .route(
             "/api/harbor-gate/setup/feishu",
@@ -850,7 +858,64 @@ async fn whatsapp_webhook(
     adapter.enqueue(messages)?;
     Ok(Json(json!({"accepted":true})))
 }
+async fn whatsapp_media(
+    State(state): State<AppState>,
+    Path(attachment_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, GatewayError> {
+    require_service_contract(&state.config, &headers)?;
+    require_service_auth(&state.config, &headers)?;
+    let route_key = headers
+        .get("X-Harbor-Route-Key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let hub_id = headers
+        .get("X-Harbor-Hub-Id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let media = tokio::time::timeout(
+        std::time::Duration::from_secs(32),
+        state
+            .gateway
+            .pull_whatsapp_media(&attachment_id, route_key, hub_id),
+    )
+    .await
+    .map_err(|_| {
+        GatewayError::new(
+            StatusCode::BAD_GATEWAY,
+            "WHATSAPP_MEDIA_UNAVAILABLE",
+            "WhatsApp image is temporarily unavailable",
+        )
+    })??;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&media.mime_type)
+            .map_err(|_| GatewayError::validation("Invalid media type"))?,
+    );
+    response_headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&media.bytes.len().to_string())
+            .map_err(|_| GatewayError::validation("Invalid media length"))?,
+    );
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response_headers.insert(
+        "X-Content-SHA256",
+        HeaderValue::from_str(&media.sha256)
+            .map_err(|_| GatewayError::validation("Invalid media hash"))?,
+    );
+    Ok((response_headers, Bytes::from(media.bytes)).into_response())
+}
 fn start_whatsapp_inbox(gateway: Arc<GatewayService>) {
+    let media_adapter = gateway.whatsapp_adapter();
+    tokio::spawn(async move {
+        loop {
+            if media_adapter.prune_expired_media_references().is_err() {
+                tracing::warn!("WhatsApp media reference cleanup is unavailable");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
     let binding_gateway = gateway.clone();
     tokio::spawn(async move {
         loop {
