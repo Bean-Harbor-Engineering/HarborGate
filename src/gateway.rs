@@ -854,7 +854,14 @@ impl GatewayService {
                 "update_message_id": update_message_id,
             },
         });
-        if route["platform"] == "whatsapp" {
+        let peer_reminder = matches!(
+            route["platform"].as_str(),
+            Some("feishu" | "weixin" | "feishu_mail")
+        ) && peer_reminder_notification(&payload);
+        if peer_reminder {
+            effective_request["peer_reminder"] = json!(true);
+        }
+        if route["platform"] == "whatsapp" || payload.get("conversation").is_some() {
             effective_request["conversation"] =
                 payload.get("conversation").cloned().unwrap_or(Value::Null);
         }
@@ -925,9 +932,23 @@ impl GatewayService {
                 idempotency_key: &idempotency_key,
             }),
         };
+        if peer_reminder {
+            outbound
+                .metadata
+                .insert("peer_reminder".into(), json!(true));
+        }
+        if let Some(event) = payload
+            .pointer("/source/event_type")
+            .or_else(|| payload.pointer("/notification/event_type"))
+            .and_then(Value::as_str)
+        {
+            outbound
+                .metadata
+                .insert("notification_event_type".into(), json!(event));
+        }
         // Preserve the originating Beacon handle, never substitute the latest
         // route's handle when an old notification is retried after rebinding.
-        if outbound.platform == "whatsapp" {
+        if outbound.platform == "whatsapp" || payload.get("conversation").is_some() {
             outbound.metadata.insert(
                 "conversation_handle".into(),
                 payload
@@ -1019,6 +1040,15 @@ impl GatewayService {
     ) -> Result<(), GatewayError> {
         let result: Result<(), GatewayError> = async {
             self.authorize_camera_delivery(outbound).await?;
+            if matches!(
+                outbound.platform.as_str(),
+                "feishu" | "weixin" | "feishu_mail"
+            ) && peer_reminder_outbound(outbound)
+            {
+                self.outbound_task_client(outbound)?
+                    .authorize_peer_delivery(outbound)
+                    .await?;
+            }
             if outbound.platform == "whatsapp" {
                 let client = self.outbound_task_client(outbound)?;
                 client.authorize_whatsapp_delivery(outbound).await?;
@@ -1912,16 +1942,44 @@ impl GatewayService {
         let platform = destination
             .get("platform")
             .and_then(Value::as_str)
-            .or_else(|| recipient.get("platform").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                recipient
+                    .get("platform")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
             .unwrap_or("")
             .trim()
             .to_string();
         let chat_id = destination
             .get("id")
             .and_then(Value::as_str)
-            .or_else(|| recipient.get("recipient_id").and_then(Value::as_str))
-            .or_else(|| recipient.get("email").and_then(Value::as_str))
-            .or_else(|| recipient.get("mail_address").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                recipient
+                    .get("recipient_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| {
+                recipient
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| {
+                recipient
+                    .get("mail_address")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
             .unwrap_or("")
             .trim()
             .to_string();
@@ -1937,7 +1995,7 @@ impl GatewayService {
             "adapter_name": platform,
             "status": "active",
             "route_mode": "proactive",
-            "route_source": if destination.get("id").is_some() { "platform_id" } else { "recipient" },
+            "route_source": if destination.get("id").and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty()) { "platform_id" } else { "recipient" },
         }))
     }
 }
@@ -2743,6 +2801,30 @@ struct NotificationDeliveryMetadata<'a> {
     content: &'a Value,
     destination: &'a serde_json::Map<String, Value>,
     idempotency_key: &'a str,
+}
+
+fn peer_reminder_notification(payload: &Value) -> bool {
+    ["/source/event_type", "/notification/event_type"]
+        .iter()
+        .any(|path| {
+            matches!(
+                payload.pointer(path).and_then(Value::as_str),
+                Some("rule.reminder" | "plan.reminder")
+            )
+        })
+        || payload
+            .pointer("/conversation/handle")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.starts_with("im_peer_notice_"))
+}
+
+fn peer_reminder_outbound(outbound: &OutboundMessage) -> bool {
+    outbound.metadata.get("peer_reminder") == Some(&json!(true))
+        || matches!(outbound.metadata.get("notification_event_type").and_then(Value::as_str), Some("rule.reminder" | "plan.reminder"))
+        || outbound.metadata.get("conversation_handle").and_then(Value::as_str).is_some_and(|value| value.starts_with("im_peer_notice_"))
+        // Pre-fix queued Native mail reminders did not preserve their permit.
+        || outbound.platform == "feishu_mail" && outbound.metadata.get("notification_id")
+            .and_then(Value::as_str).is_some_and(|value| value.starts_with("reminder-im-"))
 }
 
 fn outbound_delivery_metadata(
@@ -3980,6 +4062,10 @@ mod tests {
             .unwrap();
         assert_eq!(sends.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    mod peer_reminder_tests {
+        include!("gateway/peer_reminder_tests.rs");
     }
 
     #[tokio::test]

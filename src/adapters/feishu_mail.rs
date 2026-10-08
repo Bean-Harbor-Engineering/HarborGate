@@ -594,6 +594,29 @@ pub(crate) fn build_feishu_mail_request(
     Ok(Value::Object(request))
 }
 
+pub(crate) fn validate_member_reminder_recipient(
+    outbound: &OutboundMessage,
+) -> Result<(), GatewayError> {
+    // Use the same recipient builder as the transport, including all overrides.
+    let request = build_feishu_mail_request(outbound, "")?;
+    let to = request["to"].as_array();
+    if to.is_none_or(|recipients| {
+        recipients.len() != 1
+            || recipients[0]["mail_address"].as_str() != Some(outbound.chat_id.as_str())
+    }) || ["cc", "bcc"].iter().any(|kind| {
+        request[*kind]
+            .as_array()
+            .is_some_and(|recipients| !recipients.is_empty())
+    }) {
+        return Err(GatewayError::new(
+            reqwest::StatusCode::FORBIDDEN,
+            "IM_DELIVERY_NOT_ALLOWED",
+            "Member reminder must address only its authorized email recipient",
+        ));
+    }
+    Ok(())
+}
+
 fn mail_recipient_list(outbound: &OutboundMessage, kind: &str) -> Result<Vec<Value>, GatewayError> {
     let recipients = optional_mail_recipient_list(outbound, kind)?;
     if let Some(recipients) = recipients {
@@ -658,12 +681,15 @@ fn recipient_object_from_value(value: &Value) -> Result<Option<Value>, GatewayEr
     match value {
         Value::String(raw) => Ok(recipient_object_from_text(raw, None)),
         Value::Object(object) => {
-            let email = object
-                .get("mail_address")
-                .or_else(|| object.get("email"))
-                .or_else(|| object.get("recipient_id"))
-                .or_else(|| object.get("id"))
-                .and_then(Value::as_str)
+            let email = ["mail_address", "email", "recipient_id", "id"]
+                .iter()
+                .find_map(|key| {
+                    object
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
                 .unwrap_or("")
                 .trim();
             let name = object.get("name").and_then(Value::as_str).map(str::trim);
@@ -799,6 +825,35 @@ mod tests {
         assert_eq!(request["bcc"][0]["mail_address"], json!("bcc@example.com"));
         assert_eq!(request["dedupe_key"], json!("idem-mail-1"));
         assert_eq!(request["head_from"]["name"], json!("Harbor Ops"));
+    }
+
+    #[test]
+    fn member_reminder_validates_the_actual_unique_recipient_not_only_chat_id() {
+        let mut outbound = outbound_fixture();
+        outbound.metadata.clear();
+        validate_member_reminder_recipient(&outbound).unwrap();
+        outbound.metadata.insert(
+            "recipient".into(),
+            json!({"id":"", "mail_address":"", "recipient_id":"fallback@example.com"}),
+        );
+        validate_member_reminder_recipient(&outbound).unwrap();
+        for override_value in [
+            json!({"to":["someone-else@example.com"]}),
+            json!({"to":["fallback@example.com","someone-else@example.com"]}),
+            json!({"cc":["someone-else@example.com"]}),
+            json!({"bcc":["someone-else@example.com"]}),
+        ] {
+            outbound
+                .metadata
+                .insert("mail_recipients".into(), override_value);
+            assert!(validate_member_reminder_recipient(&outbound).is_err());
+        }
+        outbound.metadata.clear();
+        outbound.metadata.insert(
+            "recipient".into(),
+            json!({"email":"someone-else@example.com"}),
+        );
+        assert!(validate_member_reminder_recipient(&outbound).is_err());
     }
 
     #[test]
