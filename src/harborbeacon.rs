@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 pub const DEFAULT_CONTRACT_VERSION: &str = "2.0";
 pub const DEFAULT_TURN_ENDPOINT: &str = "/api/web/turns";
+mod peer_delivery;
 
 #[derive(Clone)]
 pub struct HarborBeaconTaskClient {

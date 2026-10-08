@@ -271,6 +271,14 @@ version header and v2 response/error rules.
 - Request-rejection failures use non-200 shared error envelope.
 - Accepted delivery failures use HTTP 200 with the delivery response envelope.
 
+### Member Rule/Plan email authorization extension (2026-10-08)
+
+This additive development extension keeps the existing IM v2.0 contract and service authentication. A `rule.reminder` or `plan.reminder` sent through `feishu_mail` carries its original opaque `conversation.handle` permit. Gate preserves it in the delivery fingerprint/item plan and calls Native's private `POST /api/im/peer/delivery-authorization` before preparation, after preparation and on retry/recovery, with the existing contract header. Missing permits and withdrawn membership, binding, preferences, source or original dispatch attempt deny sending.
+
+Email transport uses `destination.platform: "feishu_mail"`, the actual verified address in `destination.id` and `destination.recipient.recipient_id`, and an empty `destination.route_key`. Empty identity/address alternatives do not hide a nonempty recipient. The authorization body uses `platform: "feishu_mail"` and `delivery.route_key: "member-email"`; this is a Native authorization identifier, not a Gate transport route. `delivery.recipient` is the exact actual address, with original permit/text and no attachments or source references. The provider request's single To address must equal this authorized address; CC/BCC and recipient replacement are rejected using the actual mail recipient builder.
+
+`member.email_verification` mails remain independent of business reminder authorization. Legacy queued Native reminders with `reminder-im-` IDs still require a permit even if their pre-fix item metadata omitted it. This patch has compilation/static evidence only; regression specifications are not executed, and live delivery/retry/revocation behavior is unaccepted.
+
 ## Error Envelope
 
 Non-200 request rejections use:

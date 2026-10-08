@@ -19,7 +19,11 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Install Rust toolchain
-        run: rustup component add rustfmt clippy
+        # Match the verified K3 build compiler; hosted-image toolchain updates
+        # otherwise change macro lint results without a source change.
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
+          rustup override set 1.96.1
 
       - name: Cache cargo builds
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830

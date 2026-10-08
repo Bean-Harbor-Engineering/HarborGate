@@ -1,0 +1,15 @@
+# Member Feishu/Weixin reminder delivery
+
+Native business reminder delivery is open to active household members. Gate does not require a global administrator role or own the member, source or preference store.
+
+Native sends the existing IM v2 notification envelope with the original `conversation.handle`. For Feishu/Weixin Rule/Plan reminders, Gate retains that handle in the effective request fingerprint and item ledger and invokes the private Native service authorization before preparation, after preparation and on retries/recovery. It never substitutes a newer route handle.
+
+The private RPC is `POST /api/im/peer/delivery-authorization`, with Gate-to-Native bearer authentication, `X-Contract-Version: 2.0` and `{platform, delivery: {recipient, route_key, conversation_handle, text, has_attachments, source_refs}}`. The recipient is the actual destination chat, which can differ from the provider sender. The Native permit is opaque to Gate. Native checks the original platform/binding, active member/home, exact reminder text, source access, latest preferences and durable single attempt. Only `{allowed: true}` permits sending; forbidden, unavailable, malformed or oversized replies stop the send. This local peer RPC does not substitute a cloud WhatsApp selection.
+
+Flat `source.event_type` and enveloped `notification.event_type` values `rule.reminder` / `plan.reminder` require the peer check even with a missing handle. A supplied `im_peer_notice_` handle also requires the check if its event tag is absent. The required flag persists with the item plan. Existing legacy notifications and generic chat replies retain their existing path; their member/source mapping and final preference migration remain separate work.
+
+Either event location can require authorization. An empty, null or unrelated outer event cannot mask an enveloped reminder; a conflicting inner event cannot mask a flat reminder. Missing-permit regression tests cover the enveloped case with a null outer event and reject it before sending.
+
+Regression specifications use a local Native HTTP fixture and recording provider adapter for exact chat/route/text/permit, preparation withdrawal, missing permits, retry and restart withdrawal. On 2026-10-08, the local Rust suite passed: 184 unit tests, 27 proxy tests and 3 source/package guards, with 2 existing ignored tests. The recording-adapter cases executed missing-permit rejection, preparation withdrawal and persisted retry/restart withdrawal for Feishu, Weixin and Feishu Mail. Live provider delivery and target deployment acceptance require separate evidence.
+
+The email extension also preserves the original permit, uses direct delivery with an empty transport route and the private authorization identifier `member-email`, and verifies the actual unique To address before preparation, after preparation and on retry/recovery. Verification mail uses its separate flow. Testing, push and deployment are authorized for the finite repair; no cross-component package version restriction is added.
