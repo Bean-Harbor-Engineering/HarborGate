@@ -196,6 +196,36 @@ async fn generic_message_routes_cannot_bypass_the_signed_whatsapp_webhook() {
 }
 
 #[tokio::test]
+async fn whatsapp_media_pull_requires_beacon_service_auth() {
+    let (mut state, _directory) = test_state(
+        "http://127.0.0.1:1",
+        "fixture-token",
+        Arc::new(FakeAuthenticator::successful()),
+    );
+    state.config.contract_version = "2.0".into();
+    state.config.service_token = "beacon-to-gate-media-fixture-token-123456".into();
+    let app = router(state);
+    for path in [
+        "/api/im/whatsapp/media/wa_image_aaaaaaaaaaaaaaaaaaaaaaaa",
+        "/api/harbor-gate/api/im/whatsapp/media/wa_image_aaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header("X-Contract-Version", "2.0")
+            .header("X-Harbor-Route-Key", "gw_route_fixture")
+            .header("X-Harbor-Hub-Id", "local")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response_body(response)
+            .await
+            .contains("SERVICE_AUTH_FAILED"));
+    }
+}
+
+#[tokio::test]
 async fn protected_prefixed_search_replaces_all_client_identity() {
     let (beacon_url, captured) = mock_beacon().await;
     let authenticator = FakeAuthenticator::successful();

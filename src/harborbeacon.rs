@@ -93,8 +93,22 @@ impl HarborBeaconTaskClient {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(denied)?;
+        let source_refs = match outbound.metadata.get("source_revalidation_refs") {
+            None => Vec::new(),
+            Some(Value::Array(refs))
+                if refs.len() <= 5
+                    && refs.iter().all(|item| {
+                        item.as_str()
+                            .is_some_and(|token| !token.is_empty() && token.len() <= 2048)
+                    }) =>
+            {
+                refs.clone()
+            }
+            _ => return Err(denied()),
+        };
         let request = json!({"recipient":outbound.chat_id,"route_key":route,"conversation_handle":handle,
-            "text":outbound.text,"has_attachments":!outbound.attachments.is_empty()});
+            "text":outbound.text,"has_attachments":!outbound.attachments.is_empty(),
+            "source_refs":source_refs});
         if let Some((relay, hub)) = &self.cloud_relay {
             let response = relay
                 .authorize_delivery(hub, &request)
