@@ -1,0 +1,15 @@
+[Unit]
+Description=HarborGate WebUI middleware session transport
+After=network.target middlewared.service harboros-beacon.service
+Wants=middlewared.service harboros-beacon.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/harbor-gate-webui-edge
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /var/lib/harborbeacon-agent-ci/deployment/edge_proxy.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
