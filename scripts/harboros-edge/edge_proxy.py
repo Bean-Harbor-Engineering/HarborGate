@@ -12,13 +12,14 @@ import os
 import re
 from pathlib import Path
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, UnixConnector, WSMsgType, web
 from yarl import URL
 
 PREFIX = "/api/harbor-beacon"
 MAX_BODY = 32 * 1024 * 1024
 MAX_RESPONSE = 32 * 1024 * 1024
 SESSION_KEY = web.AppKey("session", ClientSession)
+AUTH_SESSION_KEY = web.AppKey("middleware_session", ClientSession)
 SEGMENT = r"[^/]+"
 # Explicit current WebUI route shapes; no arbitrary URL or destination proxy.
 ROUTES = {
@@ -62,6 +63,7 @@ class Config:
     workspace_id: str
     beacon_url: str = "http://127.0.0.1:4174"
     middleware_url: str = "http://127.0.0.1:6000/websocket"
+    middleware_socket: str | None = None
 
     def __post_init__(self):
         if (not self.service_token or len(self.service_token) > 4096 or any(c.isspace() for c in self.service_token)
@@ -94,6 +96,8 @@ async def rpc(ws, request_id, method, params):
             await ws.send_json({"msg": "pong"})
         elif payload.get("id") == request_id:
             if payload.get("error"):
+                if payload["error"].get("error") == 16:
+                    raise web.HTTPServiceUnavailable(text="Middleware authentication is busy", headers={"Retry-After": "1"})
                 raise web.HTTPUnauthorized(text="Invalid user session token")
             return payload.get("result")
     raise web.HTTPServiceUnavailable(text="Middleware authentication unavailable")
@@ -114,6 +118,10 @@ async def authenticate(session, config, token):
                 }])
                 if not isinstance(result, dict) or result.get("response_type") != "SUCCESS":
                     raise web.HTTPUnauthorized(text="Invalid or expired user session token")
+                # End the short-lived PAM session before admitting more page requests.
+                # The identity below comes only from successful TOKEN_PLAIN user_info,
+                # never from the Unix socket's initial OS-authenticated principal.
+                await rpc(ws, "logout", "auth.logout", [])
                 user = result.get("user_info") or {}
                 uid = user.get("pw_uid")
                 roles = user.get("privilege", {}).get("roles", [])
@@ -130,10 +138,21 @@ async def authenticate(session, config, token):
 
 def create_app(config, authenticate_user=authenticate):
     app = web.Application(client_max_size=MAX_BODY)
+    authentication_slots = asyncio.Semaphore(2)
 
     async def sessions(application):
         application[SESSION_KEY] = ClientSession(timeout=ClientTimeout(total=180, connect=5), auto_decompress=False)
+        if config.middleware_socket:
+            application[AUTH_SESSION_KEY] = ClientSession(
+                connector=UnixConnector(path=config.middleware_socket),
+                timeout=ClientTimeout(total=15, connect=5), auto_decompress=False,
+            )
+        else:
+            # Test-injected TCP middleware servers keep the exact same token protocol.
+            application[AUTH_SESSION_KEY] = application[SESSION_KEY]
         yield
+        if application[AUTH_SESSION_KEY] is not application[SESSION_KEY]:
+            await application[AUTH_SESSION_KEY].close()
         await application[SESSION_KEY].close()
 
     app.cleanup_ctx.append(sessions)
@@ -145,7 +164,12 @@ def create_app(config, authenticate_user=authenticate):
         if not re.fullmatch(r"Bearer [A-Za-z0-9_.~+/=-]{1,4096}", auth):
             raise web.HTTPUnauthorized(text="A user session token is required")
         session = request.app[SESSION_KEY]
-        uid = await authenticate_user(session, config, auth[7:])
+        try:
+            async with asyncio.timeout(30):
+                async with authentication_slots:
+                    uid = await authenticate_user(request.app[AUTH_SESSION_KEY], config, auth[7:])
+        except asyncio.TimeoutError:
+            raise web.HTTPServiceUnavailable(text="Middleware authentication is busy") from None
         body = await request.read()
         headers = {
             "Authorization": "Bearer " + config.service_token,
@@ -196,5 +220,6 @@ if __name__ == "__main__":
     config = Config(
         service_token=service_token_from_env(),
         workspace_id=os.environ.get("HARBOR_EDGE_WORKSPACE_ID", ""),
+        middleware_socket=os.environ.get("HARBOR_EDGE_MIDDLEWARE_SOCKET", "/run/middleware/middlewared.sock"),
     )
     web.run_app(create_app(config), host="127.0.0.1", port=4176, access_log=None)

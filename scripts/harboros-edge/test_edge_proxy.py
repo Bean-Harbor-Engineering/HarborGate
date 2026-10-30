@@ -1,5 +1,7 @@
 """Transport tests exercise a real fake middleware WS and a fake Beacon HTTP server."""
 import unittest
+import asyncio
+import os
 from io import BytesIO
 from pathlib import Path
 import tempfile
@@ -14,6 +16,9 @@ class EdgeProxyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.beacon_requests = []
         self.auth_tokens = []
+        self.logout_count = 0
+        self.active_authentications = 0
+        self.maximum_authentications = 0
 
         async def middleware(request):
             ws = web.WebSocketResponse()
@@ -22,16 +27,27 @@ class EdgeProxyTests(unittest.IsolatedAsyncioTestCase):
                 data = msg.json()
                 if data.get("msg") == "connect":
                     await ws.send_json({"msg": "connected", "session": "test-session"})
+                elif data.get("method") == "auth.logout":
+                    self.logout_count += 1
+                    self.active_authentications -= 1
+                    await ws.send_json({"msg": "result", "id": data["id"], "result": True})
                 elif data.get("method") == "auth.login_ex":
                     auth = data["params"][0]
                     self.auth_tokens.append(auth["token"])
+                    if auth["token"] == "busy-user-token":
+                        await ws.send_json({"msg": "result", "id": data["id"],
+                                            "error": {"error": 16, "reason": "Rate Limit Exceeded"}})
+                        continue
                     self.assertEqual(auth["mechanism"], "TOKEN_PLAIN")
                     self.assertFalse(auth["login_options"]["reconnect_token"])
                     if auth["token"] == "valid-user-token":
+                        self.active_authentications += 1
+                        self.maximum_authentications = max(self.maximum_authentications, self.active_authentications)
                         result = {"response_type": "SUCCESS", "user_info": {
                             "pw_uid": 950, "privilege": {"roles": {"$set": ["FULL_ADMIN"]}},
                         }}
                     elif auth["token"] == "readonly-user-token":
+                        self.active_authentications += 1
                         result = {"response_type": "SUCCESS", "user_info": {
                             "pw_uid": 1001, "privilege": {"roles": ["READONLY_ADMIN"]},
                         }}
@@ -50,6 +66,7 @@ class EdgeProxyTests(unittest.IsolatedAsyncioTestCase):
         middleware_app.router.add_get("/websocket", middleware)
         beacon_app = web.Application()
         beacon_app.router.add_route("*", "/{path:.*}", beacon)
+        self.middleware_handler = middleware
         self.middleware_server = TestServer(middleware_app)
         self.beacon_server = TestServer(beacon_app)
         await self.middleware_server.start_server()
@@ -85,6 +102,7 @@ class EdgeProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["X-Harbor-Workspace-Id"], "workspace-demo")
         self.assertNotIn("X-Harbor-User-Id", headers)
         self.assertNotIn("Cookie", headers)
+        self.assertEqual(self.logout_count, 1)
         self.assertIn(b'"query": "demo"', body)
 
     async def test_rejects_missing_invalid_and_non_admin_sessions_without_forwarding(self):
@@ -130,6 +148,51 @@ class EdgeProxyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.beacon_requests, [])
         finally:
             edge_proxy.MAX_BODY = original
+
+    async def test_middleware_busy_is_service_unavailable_without_identity_fallback(self):
+        response = await self.client.get("/api/harbor-beacon/models/endpoints", headers={
+            "Authorization": "Bearer busy-user-token",
+        })
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.headers["Retry-After"], "1")
+        self.assertEqual(await response.text(), "Middleware authentication is busy")
+        self.assertEqual(self.beacon_requests, [])
+
+    @unittest.skipIf(os.name == "nt", "NAS Unix socket transport runs on Linux")
+    async def test_unix_transport_authenticates_every_request_and_bounds_page_fanout(self):
+        with tempfile.TemporaryDirectory(prefix="edge-unix-") as directory:
+            socket_path = str(Path(directory) / "middleware.sock")
+            middleware_app = web.Application()
+            middleware_app.router.add_get("/websocket", self.middleware_handler)
+            runner = web.AppRunner(middleware_app)
+            await runner.setup()
+            site = web.UnixSite(runner, socket_path)
+            await site.start()
+            config = edge_proxy.Config("server-only-gate-token", "workspace-demo",
+                                       str(self.beacon_server.make_url("")).rstrip("/"),
+                                       middleware_socket=socket_path)
+            client = TestClient(TestServer(edge_proxy.create_app(config)))
+            await client.start_server()
+            try:
+                async def get():
+                    response = await client.get("/api/harbor-beacon/models/endpoints", headers={
+                        "Authorization": "Bearer valid-user-token",
+                    })
+                    await response.read()
+                    return response.status
+                self.assertEqual(await asyncio.gather(*(get() for _ in range(30))), [200] * 30)
+                self.assertEqual(len(self.auth_tokens), 30)
+                self.assertEqual(self.logout_count, 30)
+                self.assertLessEqual(self.maximum_authentications, 2)
+                invalid = await client.get("/api/harbor-beacon/models/endpoints", headers={
+                    "Authorization": "Bearer invalid-token",
+                })
+                self.assertEqual(invalid.status, 401)
+                await invalid.read()
+                self.assertEqual(len(self.beacon_requests), 30)
+            finally:
+                await client.close()
+                await runner.cleanup()
 
     def test_allowlist_rejects_ambiguous_paths_and_external_destinations(self):
         for path in ("/api/harbor-beacon/knowledge/../state", "/api/harbor-beacon/knowledge/%2e%2e/state",

@@ -13,7 +13,7 @@ Unix UID and `FULL_ADMIN` role from server-returned `user_info`, and replaces th
 user bearer and all identity headers with the server's Gate credential and
 `harboros:uid:<uid>` identity. Browser identity hints are never trusted.
 
-Listen: `127.0.0.1:4176`; upstream Beacon: `127.0.0.1:4174`; middleware: `127.0.0.1:6000/websocket`.
+Listen: `127.0.0.1:4176`; upstream Beacon: `127.0.0.1:4174`; middleware: `/run/middleware/middlewared.sock` using the existing `/websocket` protocol.
 Nginx must preserve the `/api/harbor-beacon/` URI when proxying to port 4176. The
 adapter maps that prefix to `/api/` and forwards bodies unchanged (including
 multipart audio). Every allowlisted route requires a real admin user token.
@@ -81,3 +81,28 @@ Native package tests:
 ```sh
 python3 -m unittest discover -s scripts/harboros-edge -p 'test_edge_*.py' -v
 ```
+
+## Page fanout authentication fix
+
+A real Chrome page loads more than twenty independent Assistant API resources.
+Opening an unauthenticated TCP `auth.login_ex` connection for every resource
+shares middleware's loopback-IP limit of twenty logins per minute. The initial
+implementation therefore returned 401 for valid fresh user tokens once that
+limit was reached. The underlying middleware error was errno 16, `[EBUSY] Rate
+Limit Exceeded`.
+
+Production transport now connects through the NAS's existing local Unix socket
+`/run/middleware/middlewared.sock`. Middleware treats this as its native local
+transport, while the edge still requires an explicit successful `TOKEN_PLAIN`
+exchange and derives UID/roles only from that returned user information. The
+socket's initial OS principal is never used as a browser identity. Invalid and
+already consumed tokens remain 401. Authenticated child sessions explicitly log
+out, only two token exchanges run concurrently, and actual middleware busy
+errors are 503 without anonymous fallback. No middleware security setting or
+login rate limit is changed. `HARBOR_EDGE_MIDDLEWARE_SOCKET` can select an
+existing local socket path; test-injected Config instances may use TCP mock
+servers.
+
+The live fix restarted only `harbor-gate-webui-edge`. A private backup was saved
+inside the current release's deployment directory; previous release assets were
+left intact. See `VALIDATION.md` for the live request proof and script hashes.
