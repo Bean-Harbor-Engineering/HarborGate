@@ -17,7 +17,7 @@ Listen: `127.0.0.1:4176`; upstream Beacon: `127.0.0.1:4174`; middleware: `127.0.
 Nginx must preserve the `/api/harbor-beacon/` URI when proxying to port 4176. The
 adapter maps that prefix to `/api/` and forwards bodies unchanged (including
 multipart audio). Every allowlisted route requires a real admin user token.
-Unknown paths/methods are rejected. Request bodies are capped at 20 MiB and
+Unknown paths/methods are rejected. Request bodies are capped at 32 MiB and
 responses at 32 MiB. No response or token cache is used; authentication failures
 never fall back to anonymous access.
 

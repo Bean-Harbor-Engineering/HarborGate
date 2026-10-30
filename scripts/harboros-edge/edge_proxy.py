@@ -16,7 +16,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 from yarl import URL
 
 PREFIX = "/api/harbor-beacon"
-MAX_BODY = 20 * 1024 * 1024
+MAX_BODY = 32 * 1024 * 1024
 MAX_RESPONSE = 32 * 1024 * 1024
 SESSION_KEY = web.AppKey("session", ClientSession)
 SEGMENT = r"[^/]+"

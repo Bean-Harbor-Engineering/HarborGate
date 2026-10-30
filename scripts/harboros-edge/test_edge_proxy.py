@@ -121,7 +121,7 @@ class EdgeProxyTests(unittest.IsolatedAsyncioTestCase):
     async def test_body_limit_prevents_forwarding(self):
         original = edge_proxy.MAX_BODY
         try:
-            # Application's configured limit is immutable after startup; validate actual 20MiB limit.
+            # Application's configured limit is immutable after startup; validate actual 32MiB limit.
             response = await self.client.post("/api/harbor-beacon/knowledge/search", data=BytesIO(b"x" * (original + 1)), headers={
                 "Authorization": "Bearer valid-user-token",
             })
