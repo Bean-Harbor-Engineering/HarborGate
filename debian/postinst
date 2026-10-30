@@ -23,4 +23,13 @@ systemctl daemon-reload
 systemctl enable harboros-im-gate.service
 systemctl restart harboros-im-gate.service
 
+# Only the NAS middleware WebUI needs this adapter. Native N2 uses its own
+# signed session edge and must not enable the middleware transport.
+if [ -x /usr/bin/middlewared ]; then
+  systemctl enable harbor-gate-webui-edge.service
+  # Missing/not-yet-started Beacon is handled by the unit's bounded startup
+  # attempt and systemd retry; package configuration must not invent identity.
+  systemctl restart harbor-gate-webui-edge.service || true
+fi
+
 exit 0

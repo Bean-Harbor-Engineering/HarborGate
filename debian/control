@@ -3,7 +3,7 @@ Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: libc6
+Depends: libc6, python3 (>= 3.11), python3-aiohttp (>= 3.9)
 Maintainer: Harborinno Ltd.
 Description: HarborNAS IM Gateway Service
   Background service that communicates with multi IM channel.

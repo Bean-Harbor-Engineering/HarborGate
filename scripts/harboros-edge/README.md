@@ -50,3 +50,34 @@ Run the integration tests with:
 ```sh
 python3 -m unittest discover -s scripts/harboros-edge -p test_edge_proxy.py -v
 ```
+
+## Native package installation and upgrade
+
+The existing `.github/workflows/release.yml` Debian build installs the transport
+and `edge_bootstrap.py` into `/usr/lib/harboros-im-gate/`, ships
+`debian/harbor-gate-webui-edge.service`, and declares Python/aiohttp dependencies.
+`debian/postinst` enables/restarts the edge only when `/usr/bin/middlewared`
+exists. The service has the same NAS-only condition; N2 continues using its
+existing signed session edge. The package removal hook stops/disables this NAS
+service.
+
+At each native service start the bootstrap reads the running Beacon process's
+effective credential configuration and actual `--admin-state` path. It selects
+that state's active workspace without a default identity. Credential precedence
+matches Beacon: inferred systemd credential, explicit token file, current env,
+legacy env. It writes a root-only **edge runtime copy** under
+`/run/harbor-gate-webui-edge/` plus its path/workspace in
+`/etc/default/harbor-gate-webui-edge`; shared Gate credentials remain unchanged.
+If Beacon has not been installed/started or lacks an active workspace, startup
+exits 75 and systemd retries after five seconds without a restart limit. No
+anonymous transport starts while waiting. Restart the edge after an active
+workspace or Gate credential rotation.
+
+The NAS middleware's persistent nginx template must point the existing
+`/api/harbor-beacon` entry at loopback port 4176. Unlike the demo watcher, this
+native template survives middleware regeneration as part of the OS package.
+Native package tests:
+
+```sh
+python3 -m unittest discover -s scripts/harboros-edge -p 'test_edge_*.py' -v
+```

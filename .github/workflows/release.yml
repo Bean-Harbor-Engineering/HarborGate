@@ -32,6 +32,12 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Test NAS session transport
+        run: |
+          python3 -m venv /tmp/harbor-edge-tests
+          /tmp/harbor-edge-tests/bin/pip install 'aiohttp>=3.9,<4'
+          /tmp/harbor-edge-tests/bin/python -m unittest discover -s scripts/harboros-edge -p 'test_edge_*.py' -v
+
       - name: Build release binary
         run: cargo build --release --bin harboros-im-gate --target x86_64-unknown-linux-gnu
 
@@ -44,11 +50,14 @@ jobs:
           mkdir -p ${PKG_DIR}/DEBIAN
           mkdir -p ${PKG_DIR}/usr/bin
           mkdir -p ${PKG_DIR}/etc/systemd/system
+          mkdir -p ${PKG_DIR}/usr/lib/harboros-im-gate
 
           cp ./target/x86_64-unknown-linux-gnu/release/harboros-im-gate ${PKG_DIR}/usr/bin/harboros-im-gate
           chmod +x ${PKG_DIR}/usr/bin/harboros-im-gate
 
           cp ./debian/harboros-im-gate.service ${PKG_DIR}/etc/systemd/system/
+          cp ./debian/harbor-gate-webui-edge.service ${PKG_DIR}/etc/systemd/system/
+          install -m 0644 ./scripts/harboros-edge/edge_proxy.py ./scripts/harboros-edge/edge_bootstrap.py ${PKG_DIR}/usr/lib/harboros-im-gate/
 
           cp ./debian/control ${PKG_DIR}/DEBIAN/control
           sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" ${PKG_DIR}/DEBIAN/control
