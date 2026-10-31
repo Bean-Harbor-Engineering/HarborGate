@@ -102,7 +102,11 @@ impl MediaCache {
             } else {
                 "audio/opus".into()
             },
-            name: "voice.opus".into(),
+            name: if mime_type == "audio/wav" {
+                "voice.wav".into()
+            } else {
+                "voice.opus".into()
+            },
             size_bytes: bytes.len(),
             duration_ms,
         };
@@ -261,6 +265,99 @@ pub async fn fetch_beacon_audio(
         .await
         .map_err(|_| GatewayError::infrastructure("Beacon audio download did not complete"))?;
     read_bounded_response(response).await
+}
+
+/// Return duration only for the exact ASR input format, checking RIFF chunks.
+pub fn pcm_wav_duration_ms(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut cursor = 12usize;
+    let mut valid_format = false;
+    let mut data_bytes = None;
+    while cursor.checked_add(8)? <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().ok()?) as usize;
+        let start = cursor.checked_add(8)?;
+        let end = start.checked_add(size)?;
+        if end > bytes.len() {
+            return None;
+        }
+        if &bytes[cursor..cursor + 4] == b"fmt " {
+            if size < 16 {
+                return None;
+            }
+            valid_format = u16::from_le_bytes(bytes[start..start + 2].try_into().ok()?) == 1
+                && u16::from_le_bytes(bytes[start + 2..start + 4].try_into().ok()?) == 1
+                && u32::from_le_bytes(bytes[start + 4..start + 8].try_into().ok()?) == 16000
+                && u16::from_le_bytes(bytes[start + 14..start + 16].try_into().ok()?) == 16;
+        } else if &bytes[cursor..cursor + 4] == b"data" {
+            data_bytes = Some(size);
+        }
+        cursor = end.checked_add(size % 2)?;
+    }
+    let length = data_bytes?;
+    (valid_format && length > 0 && length % 2 == 0).then_some((length as u64 * 1000) / 32000)
+}
+
+pub async fn normalize_inbound_audio(
+    ffmpeg: &Path,
+    root: &Path,
+    bytes: &[u8],
+) -> Result<(Vec<u8>, u64), GatewayError> {
+    if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES {
+        return Err(GatewayError::validation("Invalid inbound audio size"));
+    }
+    if let Some(duration) = pcm_wav_duration_ms(bytes) {
+        return Ok((bytes.to_vec(), duration));
+    }
+    tokio::fs::create_dir_all(root).await?;
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let input = root.join(format!("inbound-{id}.bin"));
+    let output = root.join(format!("inbound-{id}.wav"));
+    tokio::fs::write(&input, bytes).await?;
+    let result = async {
+        let mut command = tokio::process::Command::new(ffmpeg);
+        command
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&input)
+            .args([
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                "-fs",
+                "33554433",
+                "-f",
+                "wav",
+            ])
+            .arg(&output)
+            .kill_on_drop(true);
+        let completed = tokio::time::timeout(Duration::from_secs(20), command.output())
+            .await
+            .map_err(|_| GatewayError::infrastructure("Inbound audio normalization timed out"))?
+            .map_err(|_| GatewayError::infrastructure("Configured ffmpeg could not start"))?;
+        if !completed.status.success() {
+            return Err(GatewayError::validation(
+                "Inbound audio could not be decoded",
+            ));
+        }
+        let meta = tokio::fs::metadata(&output).await?;
+        if meta.len() == 0 || meta.len() >= MAX_MEDIA_BYTES as u64 {
+            return Err(GatewayError::validation("Normalized audio exceeds 32 MiB"));
+        }
+        let wav = tokio::fs::read(&output).await?;
+        let duration = pcm_wav_duration_ms(&wav).ok_or_else(|| {
+            GatewayError::validation("Normalized audio is not mono 16 kHz PCM WAV")
+        })?;
+        Ok((wav, duration))
+    }
+    .await;
+    let _ = tokio::fs::remove_file(input).await;
+    let _ = tokio::fs::remove_file(output).await;
+    result
 }
 
 pub async fn convert_to_opus(

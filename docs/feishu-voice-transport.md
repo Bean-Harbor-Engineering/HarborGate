@@ -20,7 +20,7 @@ HARBORGATE_FFMPEG_BIN=/var/lib/harboros-im-gate/runtime/media-tools/bin/ffmpeg
 `HARBOR_FFMPEG_BIN` remains a compatible fallback. ffmpeg needs libopus. The
 existing `FEISHU_TIMEOUT_SECONDS` defaults to 20 and is now actually applied to
 HTTP requests. The Beacon request deadline is 200 seconds. Downloaded inbound
-voice is capped at 32 MiB, served by a single-file capability for ten minutes,
+voice is decoded to mono 16 kHz PCM WAV for ASR, capped at 32 MiB, and served by a single-file capability for ten minutes,
 and expired entries are removed on subsequent cache writes.
 
 Persistent state includes prepared inbound messages, completed-turn delivery

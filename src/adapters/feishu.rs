@@ -4,7 +4,8 @@ use crate::config::FeishuConfig;
 use crate::error::GatewayError;
 use crate::harborbeacon::stable_id;
 use crate::media::{
-    convert_to_opus, fetch_beacon_audio, media_client, read_bounded_response, MAX_MEDIA_BYTES,
+    convert_to_opus, fetch_beacon_audio, media_client, normalize_inbound_audio,
+    read_bounded_response, MAX_MEDIA_BYTES,
 };
 use crate::models::{utc_now_iso, InboundMessage, OutboundMessage};
 use async_trait::async_trait;
@@ -508,6 +509,13 @@ impl FeishuAdapter {
                 || (!settings.bot_user_id.is_empty() && user_id == settings.bot_user_id)
                 || (!settings.bot_name.is_empty() && name == settings.bot_name)
         })
+    }
+
+    pub async fn prepare_inbound_audio(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(Vec<u8>, u64), GatewayError> {
+        normalize_inbound_audio(&self.ffmpeg, &self.media_root, bytes).await
     }
 
     pub async fn download_audio(

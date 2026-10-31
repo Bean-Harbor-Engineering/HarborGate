@@ -323,7 +323,10 @@ This remains contract v2.0. No additional conversation protocol is introduced.
   capability in `headers.Authorization`, `auth.type=bearer`, `expires_at`, and
   `max_size_bytes=33554432`. The Gate endpoint is `/api/media/{attachment_id}`.
   Capabilities expire after ten minutes and cannot read another attachment.
-  Platform credentials must never appear in this descriptor.
+  Platform credentials must never appear in this descriptor. Inbound voice is
+  normalized by Gate to mono 16 kHz PCM WAV with measured duration. Pending
+  delivery replays its original turn to refresh expired speech capabilities;
+  Beacon reuses the cached business answer and generated speech.
 - Beacon-generated speech uses `kind=audio`, stable `artifact_id`,
   `mime_type=audio/wav`, `url`, and `metadata.download` with the same download
   descriptor fields. Gate fetches only the configured loopback Beacon origin

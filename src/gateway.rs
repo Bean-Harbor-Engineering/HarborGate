@@ -156,12 +156,38 @@ impl GatewayService {
                     .cloned()
                     .unwrap_or_else(|| json!({"sent":true,"duplicate":true})));
             }
-            if let Some(outbound) = record.get("outbound") {
-                let outbound: OutboundMessage = serde_json::from_value(outbound.clone())?;
+            if let Some(cached_outbound) = record.get("outbound") {
+                let mut outbound: OutboundMessage =
+                    serde_json::from_value(cached_outbound.clone())?;
+                let original = record.get("prepared").cloned();
+                let original_metadata = record
+                    .get("session_metadata")
+                    .and_then(Value::as_object)
+                    .cloned();
+                // Replay the same business turn to renew short-lived speech URLs. Beacon
+                // returns its cached answer/audio; successful platform parts stay checkpointed.
+                if let (Some(client), Some(prepared), Some(metadata)) =
+                    (&self.task_client, &original, &original_metadata)
+                {
+                    let prepared: InboundMessage = serde_json::from_value(prepared.clone())?;
+                    let refreshed = client.submit_turn(&prepared, metadata).await?;
+                    if outbound.metadata.get("turn_id").and_then(Value::as_str)
+                        != Some(refreshed.task_id.as_str())
+                    {
+                        return Err(GatewayError::infrastructure(
+                            "Retry did not preserve the original turn identity",
+                        ));
+                    }
+                    outbound.attachments =
+                        native_source_bound_attachments(adapter_name, &refreshed.response_payload);
+                }
+                if let Some(key) = &replay_key {
+                    self.store.save_inbound_record(key,json!({"completed":false,"prepared":original,"session_metadata":original_metadata,"outbound":outbound}))?;
+                }
                 let response = adapter.send_outbound(outbound.clone()).await?;
                 self.record_previous_delivery(&outbound, &response)?;
                 if let Some(key) = &replay_key {
-                    self.store.save_inbound_record(key, json!({"completed":response.get("partial").and_then(Value::as_bool) != Some(true),"outbound":outbound,"response":response}))?;
+                    self.store.save_inbound_record(key, json!({"completed":response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":original,"session_metadata":original_metadata,"outbound":outbound,"response":response}))?;
                 }
                 return Ok(response);
             }
@@ -189,15 +215,15 @@ impl GatewayService {
                         .get("resource_key")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let duration = attachment
-                        .get("duration_ms")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let (mime, bytes) = self
+                    let (source_mime, bytes) = self
                         .feishu_adapter
                         .download_audio(&inbound.message_id, key)
                         .await?;
-                    self.media_cache.store(&id, &bytes, &mime, duration)?
+                    let (wav, duration) = self.feishu_adapter.prepare_inbound_audio(&bytes).await?;
+                    let mut descriptor =
+                        self.media_cache.store(&id, &wav, "audio/wav", duration)?;
+                    descriptor["metadata"]["source_mime_type"] = json!(source_mime);
+                    descriptor
                 };
             }
             if let Some(key) = &replay_key {
@@ -209,10 +235,20 @@ impl GatewayService {
             .store
             .load_history(&inbound.platform, &inbound.chat_id)
             .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
-        let session_metadata = self
-            .store
-            .load_metadata(&inbound.platform, &inbound.chat_id)
-            .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
+        let session_metadata = existing
+            .as_ref()
+            .and_then(|r| r.get("session_metadata"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or(
+                self.store
+                    .load_metadata(&inbound.platform, &inbound.chat_id)
+                    .map_err(|err| GatewayError::infrastructure(err.to_string()))?,
+            );
+        let prepared_inbound = inbound.clone();
+        if let Some(key) = &replay_key {
+            self.store.save_inbound_record(key,json!({"completed":false,"prepared":prepared_inbound,"session_metadata":session_metadata}))?;
+        }
         let resolved_route_key = inbound
             .route_key
             .trim()
@@ -364,12 +400,12 @@ impl GatewayService {
         };
         if let Some(key) = &replay_key {
             self.store
-                .save_inbound_record(key, json!({"completed":false,"outbound":outbound}))?;
+                .save_inbound_record(key, json!({"completed":false,"prepared":prepared_inbound,"session_metadata":session_metadata,"outbound":outbound}))?;
         }
         let response = adapter.send_outbound(outbound.clone()).await?;
         self.record_previous_delivery(&outbound, &response)?;
         if let Some(key) = &replay_key {
-            self.store.save_inbound_record(key, json!({"completed":response.get("partial").and_then(Value::as_bool) != Some(true),"outbound":outbound,"response":response}))?;
+            self.store.save_inbound_record(key, json!({"completed":response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":prepared_inbound,"session_metadata":session_metadata,"outbound":outbound,"response":response}))?;
         }
         Ok(response)
     }

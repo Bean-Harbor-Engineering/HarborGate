@@ -18,6 +18,7 @@ use std::sync::{
 struct Mock {
     messages: Mutex<Vec<Value>>,
     turns: Mutex<Vec<Value>>,
+    origin: Mutex<String>,
     files: Mutex<Vec<Vec<u8>>>,
     fail_image_once: AtomicBool,
 }
@@ -59,9 +60,28 @@ async fn mock_turn(State(state): State<Arc<Mock>>, Json(body): Json<Value>) -> J
             .bytes()
             .await
             .unwrap();
-        assert_eq!(bytes.as_ref(), b"mock inbound audio");
+        assert_eq!(bytes.as_ref(), short_wav().as_slice());
+        assert_eq!(part["mime_type"], "audio/wav");
+        assert_eq!(part["metadata"]["duration_ms"], 100);
     }
+    let first = !state
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|old| old["turn"]["turn_id"] == body["turn"]["turn_id"]);
     state.turns.lock().unwrap().push(body.clone());
+    if body["input"]["text"] == "retry expired audio" {
+        let origin = state.origin.lock().unwrap().clone();
+        let expires = chrono::Utc::now() + chrono::Duration::minutes(if first { -1 } else { 10 });
+        return Json(
+            json!({"turn":{"turn_id":body["turn"]["turn_id"],"trace_id":body["turn"]["trace_id"],"status":"completed"},
+            "conversation":{"handle":"conv_mock"},"reply":{"kind":"conversation","text":"cached answer"},
+            "artifacts":[{"kind":"audio","artifact_id":"cached_speech","mime_type":"audio/wav","url":format!("{origin}/api/web/media/cached_speech"),
+                "metadata":{"duration_ms":100,"download":{"url":format!("{origin}/api/web/media/cached_speech"),"method":"GET","headers":{"Authorization":"Bearer short-cap"},"expires_at":expires.to_rfc3339()}}}],
+            "delivery_hints":[{"kind":"native_audio","artifact_id":"cached_speech","fallback":"text"}]}),
+        );
+    }
     Json(
         json!({"turn":{"turn_id":body["turn"]["turn_id"],"trace_id":body["turn"]["trace_id"],"status":"completed"},
         "conversation":{"handle":"conv_mock"},"reply":{"kind":"conversation","text":"Mock retrieval result"},"artifacts":[],"delivery_hints":[]}),
@@ -81,8 +101,8 @@ async fn cached_media(
     )?;
     Ok(([("content-type", mime)], bytes))
 }
-async fn mock_audio() -> ([(&'static str, &'static str); 1], &'static [u8]) {
-    ([("content-type", "audio/opus")], b"mock inbound audio")
+async fn mock_audio() -> ([(&'static str, &'static str); 1], Vec<u8>) {
+    ([("content-type", "audio/opus")], short_wav())
 }
 
 async fn provider(state: Arc<Mock>) -> (String, tokio::task::JoinHandle<()>) {
@@ -99,9 +119,10 @@ async fn provider(state: Arc<Mock>) -> (String, tokio::task::JoinHandle<()>) {
             "/open-apis/im/v1/messages/{message}/resources/{key}",
             get(mock_audio),
         )
-        .with_state(state);
+        .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
+    *state.origin.lock().unwrap() = origin.clone();
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -161,7 +182,7 @@ async fn audio_normalization_download_and_duplicate_text_use_real_transport() {
         .await
         .unwrap();
     assert_eq!(mime, "audio/opus");
-    assert_eq!(bytes, b"mock inbound audio");
+    assert_eq!(bytes, short_wav());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     config.port = listener.local_addr().unwrap().port();
     config.harborbeacon_base_url = origin.clone();
@@ -364,4 +385,74 @@ async fn native_audio_is_converted_and_sent_after_at_most_three_images() {
     assert!(!files[0].windows(4).any(|b| b == b"RIFF"));
     task.abort();
     media_task.abort();
+}
+
+#[tokio::test]
+async fn restart_pending_audio_replays_identical_turn_to_refresh_expired_capability() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = Arc::new(Mock::default());
+    let (origin, task) = provider(state.clone()).await;
+    let mut cfg = config(temp.path(), &origin);
+    cfg.harborbeacon_base_url = origin.clone();
+    let gateway = GatewayService::from_config(&cfg).unwrap();
+    let request = event("text", "om_expired", json!({"text":"retry expired audio"}));
+    let initial = gateway
+        .handle_inbound("feishu", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(initial["partial"], true);
+    drop(gateway);
+    let restarted = GatewayService::from_config(&cfg).unwrap();
+    // Provider deliberately has no media route. The renewed descriptor reaches HTTP,
+    // then remains partial; no caption is resent and the business request is unchanged.
+    let retried = restarted.handle_inbound("feishu", request).await.unwrap();
+    assert_eq!(retried["partial"], true);
+    let turns = state.turns.lock().unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0], turns[1]);
+    assert_eq!(
+        state
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m["content"].as_str().unwrap().contains("cached answer"))
+            .count(),
+        1
+    );
+    let records: Value =
+        serde_json::from_slice(&std::fs::read(cfg.data_dir.join("_inbound.json")).unwrap())
+            .unwrap();
+    let record = records.as_object().unwrap().values().next().unwrap();
+    assert!(record["prepared"].is_object() && record["session_metadata"].is_object());
+    let expiry = record["outbound"]["attachments"][0]["metadata"]["download"]["expires_at"]
+        .as_str()
+        .unwrap();
+    assert!(chrono::DateTime::parse_from_rfc3339(expiry).unwrap() > chrono::Utc::now());
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires a real ffmpeg with libopus; run explicitly on the demo build/runtime host"]
+async fn inbound_opus_is_normalized_to_mono_16k_pcm_wav() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.wav");
+    let opus = temp.path().join("source.opus");
+    std::fs::write(&source, short_wav()).unwrap();
+    let ffmpeg = std::env::var("HARBORGATE_TEST_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    harborgate::media::convert_to_opus(std::path::Path::new(&ffmpeg), &source, &opus)
+        .await
+        .unwrap();
+    let encoded = std::fs::read(&opus).unwrap();
+    assert!(encoded.windows(8).any(|b| b == b"OpusHead"));
+    let (wav, duration) = harborgate::media::normalize_inbound_audio(
+        std::path::Path::new(&ffmpeg),
+        temp.path(),
+        &encoded,
+    )
+    .await
+    .unwrap();
+    assert_eq!(harborgate::media::pcm_wav_duration_ms(&wav), Some(duration));
+    assert!(duration >= 90 && duration <= 110);
+    assert!(wav.starts_with(b"RIFF"));
 }
