@@ -187,7 +187,7 @@ impl GatewayService {
                 let response = adapter.send_outbound(outbound.clone()).await?;
                 self.record_previous_delivery(&outbound, &response)?;
                 if let Some(key) = &replay_key {
-                    self.store.save_inbound_record(key, json!({"completed":response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":original,"session_metadata":original_metadata,"outbound":outbound,"response":response}))?;
+                    self.store.save_inbound_record(key, json!({"completed":response.get("sent").and_then(Value::as_bool) == Some(true) && response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":original,"session_metadata":original_metadata,"outbound":outbound,"response":response}))?;
                 }
                 return Ok(response);
             }
@@ -405,7 +405,7 @@ impl GatewayService {
         let response = adapter.send_outbound(outbound.clone()).await?;
         self.record_previous_delivery(&outbound, &response)?;
         if let Some(key) = &replay_key {
-            self.store.save_inbound_record(key, json!({"completed":response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":prepared_inbound,"session_metadata":session_metadata,"outbound":outbound,"response":response}))?;
+            self.store.save_inbound_record(key, json!({"completed":response.get("sent").and_then(Value::as_bool) == Some(true) && response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":prepared_inbound,"session_metadata":session_metadata,"outbound":outbound,"response":response}))?;
         }
         Ok(response)
     }

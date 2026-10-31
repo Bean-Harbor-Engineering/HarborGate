@@ -456,3 +456,29 @@ async fn inbound_opus_is_normalized_to_mono_16k_pcm_wav() {
     assert!(duration >= 90 && duration <= 110);
     assert!(wav.starts_with(b"RIFF"));
 }
+
+#[tokio::test]
+async fn preview_delivery_does_not_consume_a_message_before_live_send_is_enabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = Arc::new(Mock::default());
+    let (origin, task) = provider(state.clone()).await;
+    let mut cfg = config(temp.path(), &origin);
+    cfg.feishu.enable_live_send = false;
+    let payload = event("text", "om_before_live", json!({"text":"hello"}));
+    let preview = GatewayService::from_config(&cfg)
+        .unwrap()
+        .handle_inbound("feishu", payload.clone())
+        .await
+        .unwrap();
+    assert_eq!(preview["sent"], false);
+    assert!(state.messages.lock().unwrap().is_empty());
+    cfg.feishu.enable_live_send = true;
+    let actual = GatewayService::from_config(&cfg)
+        .unwrap()
+        .handle_inbound("feishu", payload)
+        .await
+        .unwrap();
+    assert_eq!(actual["sent"], true);
+    assert_eq!(state.messages.lock().unwrap().len(), 1);
+    task.abort();
+}
