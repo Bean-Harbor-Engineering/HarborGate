@@ -42,7 +42,9 @@ impl HarborBeaconTaskClient {
             api_token: config.harborbeacon_token.clone(),
             turn_endpoint: config.harborbeacon_turn_endpoint.clone(),
             contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
-            http: Client::new(),
+            http: Client::builder().connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(200)).redirect(reqwest::redirect::Policy::none())
+                .build().expect("valid Beacon HTTP client"),
         })
     }
 
@@ -60,8 +62,11 @@ impl HarborBeaconTaskClient {
             .get("continuation")
             .filter(|value| value.is_object())
             .cloned();
-        let request_payload =
+        let mut request_payload =
             build_turn_request(incoming, conversation_handle.as_deref(), continuation);
+        if let Some(previous) = session_metadata.get("previous_delivery").filter(|v| v.is_object()) {
+            request_payload["transport"]["metadata"]["previous_delivery"] = previous.clone();
+        }
         let response_payload = self.post_json(&request_payload).await?;
         Ok(map_turn_response(&request_payload, response_payload))
     }
@@ -212,7 +217,8 @@ pub fn build_turn_request(
                 "text": true,
                 "image": true,
                 "file": true,
-                "video": true,
+                "video": incoming.platform != "feishu",
+                "audio": incoming.platform == "feishu",
             },
             "metadata": metadata,
         },

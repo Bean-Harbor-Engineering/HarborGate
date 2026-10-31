@@ -9,13 +9,15 @@ use crate::harborbeacon::{
     build_channel_turn_request, derive_route_key, derive_session_id, stable_id,
     HarborBeaconTaskClient,
 };
+use crate::media::MediaCache;
 use crate::models::{ConversationTurn, InboundMessage, OutboundMessage};
 use crate::store::FileSessionStore;
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 pub struct GatewayService {
     store: Arc<FileSessionStore>,
@@ -24,6 +26,8 @@ pub struct GatewayService {
     feishu_adapter: Arc<FeishuAdapter>,
     feishu_mail_adapter: Arc<FeishuMailAdapter>,
     weixin_adapter: Arc<WeixinAdapter>,
+    media_cache: Arc<MediaCache>,
+    chat_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl GatewayService {
@@ -32,7 +36,23 @@ impl GatewayService {
         let mut adapters: BTreeMap<String, Arc<dyn PlatformAdapter>> = BTreeMap::new();
         let webhook = Arc::new(WebhookAdapter);
         adapters.insert(webhook.name().to_string(), webhook);
-        let feishu = Arc::new(FeishuAdapter::new(config.feishu.clone()));
+        let ffmpeg = std::env::var("HARBORGATE_FFMPEG_BIN")
+            .or_else(|_| std::env::var("HARBOR_FFMPEG_BIN"))
+            .unwrap_or_else(|_| "ffmpeg".into());
+        let beacon_media_origin =
+            std::env::var("HARBOR_BEACON_MEDIA_ORIGIN").unwrap_or_else(|_| {
+                if config.harborbeacon_base_url.is_empty() {
+                    "http://127.0.0.1:4174".into()
+                } else {
+                    config.harborbeacon_base_url.clone()
+                }
+            });
+        let feishu = Arc::new(FeishuAdapter::with_media(
+            config.feishu.clone(),
+            config.state_dir.join("media-outbound"),
+            PathBuf::from(ffmpeg),
+            beacon_media_origin,
+        ));
         adapters.insert(feishu.name().to_string(), feishu.clone());
         let feishu_mail = Arc::new(FeishuMailAdapter::new(config.feishu_mail.clone()));
         adapters.insert(feishu_mail.name().to_string(), feishu_mail.clone());
@@ -45,6 +65,11 @@ impl GatewayService {
             feishu_adapter: feishu,
             feishu_mail_adapter: feishu_mail,
             weixin_adapter: weixin,
+            media_cache: Arc::new(MediaCache::new(
+                config.state_dir.join("media-inbound"),
+                config.port,
+            )?),
+            chat_locks: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -64,6 +89,31 @@ impl GatewayService {
         self.weixin_adapter.clone()
     }
 
+    pub fn read_media(
+        &self,
+        id: &str,
+        authorization: &str,
+    ) -> Result<(String, Vec<u8>), GatewayError> {
+        self.media_cache.read(id, authorization)
+    }
+
+    fn record_previous_delivery(
+        &self,
+        outbound: &OutboundMessage,
+        response: &Value,
+    ) -> Result<(), GatewayError> {
+        if let Some(receipts) = response.get("delivery_receipts").filter(|v| v.is_array()) {
+            let mut metadata = self
+                .store
+                .load_metadata(&outbound.platform, &outbound.chat_id)?;
+            metadata.insert("previous_delivery".into(), json!({"turn_id":outbound.metadata.get("turn_id"),
+                "status":if response.get("partial").and_then(Value::as_bool) == Some(true) {"partial"} else {"completed"},"receipts":receipts}));
+            self.store
+                .set_metadata(&outbound.platform, &outbound.chat_id, metadata)?;
+        }
+        Ok(())
+    }
+
     pub async fn handle_inbound(
         &self,
         adapter_name: &str,
@@ -72,7 +122,89 @@ impl GatewayService {
         let adapter = self
             .adapter(adapter_name)
             .ok_or_else(|| GatewayError::validation(format!("Unknown adapter: {adapter_name}")))?;
-        let inbound = adapter.normalize_inbound(payload)?;
+        let mut inbound = adapter.normalize_inbound(payload)?;
+        let chat_key = format!("{}|{}", inbound.platform, inbound.chat_id);
+        let chat_lock = self
+            .chat_locks
+            .lock()
+            .expect("chat locks poisoned")
+            .entry(chat_key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _chat_guard = chat_lock.lock().await;
+        let replay_key = if adapter_name == "feishu" && !inbound.message_id.is_empty() {
+            Some(stable_id(
+                "inbound_",
+                &format!(
+                    "{}|{}|{}",
+                    inbound.platform, inbound.chat_id, inbound.message_id
+                ),
+                40,
+            ))
+        } else {
+            None
+        };
+        let existing = replay_key
+            .as_deref()
+            .map(|key| self.store.load_inbound_record(key))
+            .transpose()?
+            .flatten();
+        if let Some(record) = &existing {
+            if record.get("completed").and_then(Value::as_bool) == Some(true) {
+                return Ok(record
+                    .get("response")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"sent":true,"duplicate":true})));
+            }
+            if let Some(outbound) = record.get("outbound") {
+                let outbound: OutboundMessage = serde_json::from_value(outbound.clone())?;
+                let response = adapter.send_outbound(outbound.clone()).await?;
+                self.record_previous_delivery(&outbound, &response)?;
+                if let Some(key) = &replay_key {
+                    self.store.save_inbound_record(key, json!({"completed":response.get("partial").and_then(Value::as_bool) != Some(true),"outbound":outbound,"response":response}))?;
+                }
+                return Ok(response);
+            }
+            if let Some(prepared) = record.get("prepared") {
+                inbound = serde_json::from_value(prepared.clone())?;
+            }
+        }
+        if adapter_name == "feishu" && existing.as_ref().and_then(|r| r.get("prepared")).is_none() {
+            for attachment in &mut inbound.attachments {
+                if attachment.get("kind").and_then(Value::as_str) != Some("audio") {
+                    continue;
+                }
+                let id = stable_id(
+                    "att_",
+                    &format!(
+                        "{}|{}|{}",
+                        inbound.platform, inbound.chat_id, inbound.message_id
+                    ),
+                    40,
+                );
+                *attachment = if let Some(descriptor) = self.media_cache.descriptor(&id)? {
+                    descriptor
+                } else {
+                    let key = attachment
+                        .get("resource_key")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let duration = attachment
+                        .get("duration_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let (mime, bytes) = self
+                        .feishu_adapter
+                        .download_audio(&inbound.message_id, key)
+                        .await?;
+                    self.media_cache.store(&id, &bytes, &mime, duration)?
+                };
+            }
+            if let Some(key) = &replay_key {
+                self.store
+                    .save_inbound_record(key, json!({"completed":false,"prepared":inbound}))?;
+            }
+        }
         let history = self
             .store
             .load_history(&inbound.platform, &inbound.chat_id)
@@ -105,11 +237,24 @@ impl GatewayService {
                 let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
                 let attachments =
                     native_source_bound_attachments(adapter_name, &task_result.response_payload);
-                let reply_text = render_retrieval_reply(
+                let mut reply_text = render_retrieval_reply(
                     &task_result.text,
                     &task_result.response_payload,
                     !attachments.is_empty(),
                 );
+                let image_count = attachments
+                    .iter()
+                    .filter(|a| a.get("kind").and_then(Value::as_str) == Some("image"))
+                    .count();
+                if adapter_name == "feishu" && image_count > 0 {
+                    reply_text.push_str(&format!(
+                        "\n图片按发送顺序编号：{}。",
+                        (1..=image_count)
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ));
+                }
                 let mut next_metadata = session_metadata.clone();
                 next_metadata.insert("route_key".into(), json!(task_result.route_key));
                 next_metadata.insert("session_id".into(), json!(resolved_session_id));
@@ -217,7 +362,16 @@ impl GatewayService {
             timestamp: crate::models::utc_now_iso(),
             metadata: outbound_metadata,
         };
-        adapter.send_outbound(outbound).await
+        if let Some(key) = &replay_key {
+            self.store
+                .save_inbound_record(key, json!({"completed":false,"outbound":outbound}))?;
+        }
+        let response = adapter.send_outbound(outbound.clone()).await?;
+        self.record_previous_delivery(&outbound, &response)?;
+        if let Some(key) = &replay_key {
+            self.store.save_inbound_record(key, json!({"completed":response.get("partial").and_then(Value::as_bool) != Some(true),"outbound":outbound,"response":response}))?;
+        }
+        Ok(response)
     }
 
     pub async fn handle_gateway_turn(&self, payload: Value) -> Result<Value, GatewayError> {
@@ -738,32 +892,51 @@ fn native_source_bound_attachments(adapter_name: &str, response_payload: &Value)
         return weixin_native_attachments(artifacts, response_payload);
     }
     let images: Vec<Value> = artifacts
-        .into_iter()
+        .iter()
         .filter(|artifact| {
-            let kind = artifact
-                .get("kind")
-                .or_else(|| artifact.get("type"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let mime_type = artifact
-                .get("mime_type")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let path = artifact.get("path").and_then(Value::as_str).unwrap_or("");
-            kind == "image" && mime_type.starts_with("image/") && !path.trim().is_empty()
+            artifact.get("kind").and_then(Value::as_str) == Some("image")
+                && artifact
+                    .get("mime_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .starts_with("image/")
+                && artifact
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
         })
+        .cloned()
         .collect();
-    if images.is_empty() {
-        return vec![];
-    }
-    if let Some(limit) = native_image_limit(response_payload) {
-        return images.into_iter().take(limit).collect();
-    }
-    if images.len() == 1 {
+    let mut result = if let Some(limit) = native_image_limit(response_payload) {
+        images.into_iter().take(limit).collect()
+    } else if images.len() == 1 {
         images
     } else {
-        vec![]
+        Vec::new()
+    };
+    for (kind, hint_kind) in [("file", "native_file"), ("audio", "native_audio")] {
+        for artifact in artifacts
+            .iter()
+            .filter(|a| a.get("kind").and_then(Value::as_str) == Some(kind))
+            .take(1)
+        {
+            let id = artifact.get("artifact_id").and_then(Value::as_str);
+            let hinted = response_payload
+                .get("delivery_hints")
+                .and_then(Value::as_array)
+                .is_some_and(|hints| {
+                    hints.iter().any(|h| {
+                        h.get("kind").and_then(Value::as_str) == Some(hint_kind)
+                            && (h.get("artifact_id").and_then(Value::as_str).is_none()
+                                || h.get("artifact_id").and_then(Value::as_str) == id)
+                    })
+                });
+            if hinted {
+                result.push(artifact.clone());
+            }
+        }
     }
+    result
 }
 
 fn weixin_native_attachments(artifacts: Vec<Value>, response_payload: &Value) -> Vec<Value> {
@@ -1208,6 +1381,33 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn feishu_media_projection_requires_hints_and_keeps_original_kind() {
+        let payload = json!({"artifacts":[
+            {"kind":"image","artifact_id":"photo_1","mime_type":"image/jpeg","path":"/photo.jpg"},
+            {"kind":"file","artifact_id":"original_1","mime_type":"image/jpeg","path":"/photo.jpg"},
+            {"kind":"audio","artifact_id":"speech_1","mime_type":"audio/wav","url":"http://127.0.0.1:4174/api/web/media/speech_1"}],
+            "delivery_hints":[{"kind":"native_image","metadata":{"max_items":3}},
+                {"kind":"native_file","artifact_id":"original_1"},{"kind":"native_audio","artifact_id":"speech_1"}]});
+        let parts = native_source_bound_attachments("feishu", &payload);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|p| p["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["image", "file", "audio"]
+        );
+        let mut no_hint = payload.clone();
+        no_hint["delivery_hints"] = json!([]);
+        assert_eq!(native_source_bound_attachments("feishu", &no_hint).len(), 1);
+        assert!(
+            native_source_bound_attachments("weixin", &payload)
+                .iter()
+                .all(|part| part["kind"] != "audio"),
+            "Weixin voice must not be advertised as supported"
+        );
+    }
 
     #[tokio::test]
     async fn webhook_inbound_registers_route_and_replies() {

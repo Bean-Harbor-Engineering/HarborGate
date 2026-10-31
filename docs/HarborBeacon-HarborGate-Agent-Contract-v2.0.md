@@ -309,3 +309,33 @@ v2.0 is release-ready only when:
   cancel, record, and playback cases.
 - Direct IM delivery and raw platform credential ownership remain outside
   HarborBeacon.
+
+## Feishu voice/media transport extension (2026-10-31)
+
+This remains contract v2.0. No additional conversation protocol is introduced.
+
+- Feishu advertises `transport.capabilities.audio=true`; Weixin does not. The
+  existing text/image/file capabilities retain their meanings.
+- An audio `input.parts` item uses the existing attachment descriptor fields:
+  `attachment_id`, `type=audio`, `name`, `mime_type`, `size_bytes`, `download`,
+  and `metadata.duration_ms`. Gate downloads the platform resource itself.
+- `download` uses `mode=proxy`, `method=GET`, `url`, a single-file opaque bearer
+  capability in `headers.Authorization`, `auth.type=bearer`, `expires_at`, and
+  `max_size_bytes=33554432`. The Gate endpoint is `/api/media/{attachment_id}`.
+  Capabilities expire after ten minutes and cannot read another attachment.
+  Platform credentials must never appear in this descriptor.
+- Beacon-generated speech uses `kind=audio`, stable `artifact_id`,
+  `mime_type=audio/wav`, `url`, and `metadata.download` with the same download
+  descriptor fields. Gate fetches only the configured loopback Beacon origin
+  and `/api/web/media/` prefix, with redirects disabled.
+- A `native_audio` hint refers to that audio artifact; its fallback is text.
+  Gate converts speech to Opus, uploads it, and sends a native Feishu audio
+  message. An original photo requested as a file uses `kind=file` and a
+  `native_file` hint, preserving file bytes rather than using image compression.
+- Feishu delivery order is text/card, at most three ordered images, an optional
+  original file, then optional audio. Per-part provider receipts are Gate-owned
+  delivery state. A partial send is explicitly reported and retries skip parts
+  already sent; the same platform message must not create a new business turn.
+- Incoming websocket events are acknowledged before business processing.
+  Platform HTTP operations and audio conversion are bounded to twenty seconds;
+  Gate waits at most two hundred seconds for Beacon's business response.
