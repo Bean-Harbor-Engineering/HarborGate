@@ -967,7 +967,7 @@ impl PlatformAdapter for FeishuAdapter {
         let result = async {
             if let Some(cached) = self.cached_part(&outbound, 0)? { responses.push(cached); }
             else {
-                let response = if let Some(card) = outbound.metadata.get("feishu_card").or_else(|| outbound.metadata.get("structured_payload")).filter(|v| v.is_object()) {
+                let response = if let Some(card) = outbound.metadata.get("feishu_card").or_else(|| outbound.metadata.get("structured_payload")).filter(|v| v.as_object().is_some_and(|card| !card.is_empty())) {
                     Some(self.send_card(&outbound, card.clone(), &token).await?)
                 } else if !outbound.text.trim().is_empty() { Some(self.send_text(&outbound, &token).await?) } else { None };
                 if let Some(response) = response { self.save_part(&outbound, 0, &response)?; responses.push(response); }

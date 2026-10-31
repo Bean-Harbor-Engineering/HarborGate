@@ -482,3 +482,112 @@ async fn preview_delivery_does_not_consume_a_message_before_live_send_is_enabled
     assert_eq!(state.messages.lock().unwrap().len(), 1);
     task.abort();
 }
+
+#[tokio::test]
+async fn notification_http_reports_partial_and_retry_only_sends_missing_part() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = Arc::new(Mock::default());
+    let (origin, task) = provider(state.clone()).await;
+    let mut cfg = config(temp.path(), &origin);
+    cfg.service_token = "mock_internal_token".into();
+    cfg.contract_version = "2.0".into();
+    let gateway = Arc::new(GatewayService::from_config(&cfg).unwrap());
+    gateway
+        .handle_inbound(
+            "feishu",
+            event("text", "om_notify_route", json!({"text":"register route"})),
+        )
+        .await
+        .unwrap();
+    state.messages.lock().unwrap().clear();
+    state.fail_image_once.store(true, Ordering::SeqCst);
+    let routes: Value =
+        serde_json::from_slice(&std::fs::read(cfg.data_dir.join("_routes.json")).unwrap()).unwrap();
+    let route = routes.as_object().unwrap().keys().next().unwrap();
+    let image = temp.path().join("notification.jpg");
+    std::fs::write(&image, b"mock image").unwrap();
+    let payload = json!({"notification":{"notification_id":"notif_ready","trace_id":"trace_ready","event_type":"demo.ready"},
+        "conversation":{"handle":"conv_opaque"},"destination":{"route_key":route},"reply":{"kind":"tool_result","text":"Ready notification"},
+        "artifacts":[{"kind":"image","artifact_id":"photo_1","mime_type":"image/jpeg","path":image}],
+        "delivery_hints":[{"kind":"native_image","metadata":{"max_items":3}}],
+        "delivery":{"mode":"send","idempotency_key":"idem_ready","reply_to_message_id":null,"update_message_id":null}});
+    let appstate = harborgate::server::AppState {
+        config: cfg.clone(),
+        gateway: gateway.clone(),
+        setup: Arc::new(harborgate::setup::SetupPortalService::new(cfg, gateway)),
+        feishu_websocket_started: Arc::new(AtomicBool::new(false)),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!(
+        "http://{}/api/notifications/deliveries",
+        listener.local_addr().unwrap()
+    );
+    let api_task = tokio::spawn(async move {
+        axum::serve(listener, harborgate::server::router(appstate))
+            .await
+            .unwrap();
+    });
+    let http = reqwest::Client::new();
+    let first: Value = http
+        .post(&api)
+        .header("X-Contract-Version", "2.0")
+        .bearer_auth("mock_internal_token")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["ok"], false);
+    assert_eq!(first["sent"], false);
+    assert_eq!(first["partial"], true);
+    assert_eq!(first["status"], "partial");
+    assert_eq!(first["retryable"], true);
+    let second: Value = http
+        .post(&api)
+        .header("X-Contract-Version", "2.0")
+        .bearer_auth("mock_internal_token")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["ok"], true);
+    assert_eq!(second["sent"], true);
+    assert_eq!(second["partial"], false);
+    assert_eq!(second["delivery_receipts"][0]["artifact_id"], "photo_1");
+    let count = state.messages.lock().unwrap().len();
+    let replay: Value = http
+        .post(&api)
+        .header("X-Contract-Version", "2.0")
+        .bearer_auth("mock_internal_token")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replay, second);
+    assert_eq!(state.messages.lock().unwrap().len(), count);
+    let messages = state.messages.lock().unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["content"]
+                .as_str()
+                .unwrap()
+                .contains("Ready notification"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages.iter().filter(|m| m["msg_type"] == "image").count(),
+        2
+    );
+    task.abort();
+    api_task.abort();
+}

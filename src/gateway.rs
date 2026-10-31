@@ -636,7 +636,13 @@ impl GatewayService {
                 .with_trace(trace_id));
             }
             if let Some(response) = record.get("response_payload") {
-                return Ok(response.clone());
+                if response.get("sent").and_then(Value::as_bool) == Some(true)
+                    && response.get("ok").and_then(Value::as_bool) == Some(true)
+                {
+                    return Ok(response.clone());
+                }
+                // Keep the fingerprint for conflict detection, but retry incomplete
+                // deliveries. Adapter checkpoints skip parts already delivered.
             }
         }
 
@@ -682,16 +688,22 @@ impl GatewayService {
                     .unwrap_or("")
                     .trim()
                     .to_string();
+                let sent = adapter_response.get("sent").and_then(Value::as_bool) == Some(true);
+                let partial = adapter_response.get("partial").and_then(Value::as_bool) == Some(true);
+                let complete = sent && !partial;
                 json!({
                     "delivery_id": delivery_id,
                     "notification_id": notification_id,
                     "trace_id": trace_id,
-                    "ok": true,
-                    "status": adapter_response.get("placeholder_status").and_then(Value::as_str).unwrap_or("sent"),
+                    "ok": complete,
+                    "sent": complete,
+                    "partial": partial,
+                    "status": if partial { "partial" } else if complete { "sent" } else { "not_sent" },
                     "platform": route.get("platform").and_then(Value::as_str).unwrap_or(&adapter_name),
                     "provider_message_id": if provider_message_id.is_empty() { Value::Null } else { json!(provider_message_id) },
-                    "retryable": false,
-                    "error": null,
+                    "delivery_receipts": adapter_response.get("delivery_receipts").cloned().unwrap_or_else(||json!([])),
+                    "retryable": !complete,
+                    "error": if complete { Value::Null } else { adapter_response.get("error").cloned().unwrap_or_else(||json!({"code":"DELIVERY_NOT_SENT","message":"Platform did not confirm complete message delivery"})) },
                 })
             }
             Err(error) => {
@@ -1569,7 +1581,9 @@ mod tests {
         let replay = gateway.handle_notification_delivery(payload).await.unwrap();
 
         assert_eq!(response, replay);
-        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["sent"], json!(false));
+        assert_eq!(response["status"], json!("not_sent"));
         assert_eq!(response["platform"], json!("webhook"));
         assert_eq!(response["notification_id"], json!("notif_lve_1"));
     }
