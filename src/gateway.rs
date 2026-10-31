@@ -963,26 +963,23 @@ fn native_source_bound_attachments(adapter_name: &str, response_payload: &Value)
         Vec::new()
     };
     for (kind, hint_kind) in [("file", "native_file"), ("audio", "native_audio")] {
-        for artifact in artifacts
-            .iter()
-            .filter(|a| a.get("kind").and_then(Value::as_str) == Some(kind))
-            .take(1)
-        {
+        let eligible = artifacts.iter().filter(|artifact| {
+            if artifact.get("kind").and_then(Value::as_str) != Some(kind) {
+                return false;
+            }
             let id = artifact.get("artifact_id").and_then(Value::as_str);
-            let hinted = response_payload
+            response_payload
                 .get("delivery_hints")
                 .and_then(Value::as_array)
                 .is_some_and(|hints| {
-                    hints.iter().any(|h| {
-                        h.get("kind").and_then(Value::as_str) == Some(hint_kind)
-                            && (h.get("artifact_id").and_then(Value::as_str).is_none()
-                                || h.get("artifact_id").and_then(Value::as_str) == id)
+                    hints.iter().any(|hint| {
+                        hint.get("kind").and_then(Value::as_str) == Some(hint_kind)
+                            && (hint.get("artifact_id").and_then(Value::as_str).is_none()
+                                || hint.get("artifact_id").and_then(Value::as_str) == id)
                     })
-                });
-            if hinted {
-                result.push(artifact.clone());
-            }
-        }
+                })
+        });
+        result.extend(eligible.take(1).cloned());
     }
     result
 }
@@ -1455,6 +1452,25 @@ mod tests {
                 .all(|part| part["kind"] != "audio"),
             "Weixin voice must not be advertised as supported"
         );
+    }
+
+    #[test]
+    fn feishu_media_projection_ignores_unhinted_candidates_before_limits() {
+        let payload = json!({"artifacts": [
+            {"kind":"audio", "path":"/retrieved-recording.wav", "mime_type":"audio/wav"},
+            {"kind":"file", "artifact_id":"unselected_source", "path":"/other.md"},
+            {"kind":"audio", "artifact_id":"speech_actual", "mime_type":"audio/wav",
+                "url":"http://127.0.0.1:4174/api/web/media/speech_actual"},
+            {"kind":"file", "artifact_id":"selected_source", "path":"/backup-guide.md"},
+            {"kind":"audio", "artifact_id":"speech_other", "mime_type":"audio/wav"}
+        ], "delivery_hints": [
+            {"kind":"native_audio", "artifact_id":"speech_actual"},
+            {"kind":"native_file", "artifact_id":"selected_source"}
+        ]});
+        let parts = native_source_bound_attachments("feishu", &payload);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["artifact_id"], "selected_source");
+        assert_eq!(parts[1]["artifact_id"], "speech_actual");
     }
 
     #[tokio::test]
