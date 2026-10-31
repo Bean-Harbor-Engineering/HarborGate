@@ -844,7 +844,7 @@ mod tests {
         let (token, mode) = adapter.access_token().await.unwrap();
         let requests = request_handle.await.unwrap();
         let state: UserTokenState =
-            serde_json::from_str(&std::fs::read_to_string(state_path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
 
         assert_eq!(mode, "user_refresh_token");
         assert_eq!(token, "fresh-user-token");
