@@ -368,3 +368,8 @@ This is an additive v2.0 extension; the service header remains `2.0`.
   Result cards are sent as new replies; this extension does not require message editing.
 - Cards without interactive-card capability degrade to useful text; unsupported
   clients must not be told that a model was switched.
+
+The explicitly approved 2026-11-02 Demo may use a server-owned, expiring
+actor/route/workspace permission grant instead of an identity binding. Gate still
+verifies the callback source and private operator; Beacon still owns all business
+checks and global selection state. This exception does not change platform roles.
