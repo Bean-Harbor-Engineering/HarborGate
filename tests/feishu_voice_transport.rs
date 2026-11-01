@@ -214,11 +214,14 @@ async fn audio_normalization_download_and_duplicate_text_use_real_transport() {
         .await
         .unwrap();
     gateway.handle_inbound("feishu", payload).await.unwrap();
-    assert_eq!(
-        state.messages.lock().unwrap().len(),
-        2,
-        "each unique voice/text message must send exactly once"
-    );
+    let messages = state.messages.lock().unwrap().clone();
+    let ack_count = messages.iter().filter(|message| {
+        serde_json::from_str::<Value>(message["content"].as_str().unwrap_or("{}"))
+            .ok().is_some_and(|body| body["text"] == "收到，正在处理…")
+    }).count();
+    assert_eq!(ack_count, 1, "the voice message has one transport acknowledgement");
+    assert_eq!(messages.len() - ack_count, 2,
+        "each unique voice/text business result must still send exactly once");
     let restarted = GatewayService::from_config(&config).unwrap();
     restarted
         .handle_inbound("feishu", event("text", "om_once", json!({"text":"hello"})))
@@ -226,8 +229,8 @@ async fn audio_normalization_download_and_duplicate_text_use_real_transport() {
         .unwrap();
     assert_eq!(
         state.messages.lock().unwrap().len(),
-        2,
-        "restart must retain completed-message dedupe"
+        3,
+        "restart must retain both acknowledgement and completed-message dedupe"
     );
     assert_eq!(
         state.turns.lock().unwrap()[1]["conversation"]["handle"],

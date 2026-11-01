@@ -114,15 +114,74 @@ impl GatewayService {
         Ok(())
     }
 
+    async fn feishu_transport_notice(&self, inbound: &InboundMessage, failure: bool) {
+        let identity = format!("{}|{}|{}", inbound.platform, inbound.chat_id, inbound.message_id);
+        let key = stable_id(if failure { "processing_failure_" } else { "processing_ack_" }, &identity, 40);
+        let notice_lock = self.chat_locks.lock().expect("chat locks poisoned")
+            .entry(format!("processing_notice|{}|{}", inbound.platform, inbound.chat_id))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+        let _notice_guard = notice_lock.lock().await;
+        if !failure {
+            let inbound_key = stable_id("inbound_", &identity, 40);
+            if self.store.load_inbound_record(&inbound_key).ok().flatten()
+                .is_some_and(|record| record.get("completed").and_then(Value::as_bool) == Some(true)
+                    || record.get("outbound").is_some())
+            {
+                return;
+            }
+        }
+        // Reserve a separate transport ledger entry before sending. An uncertain
+        // provider response must not produce another acknowledgement on replay.
+        match self.store.load_delivery_record(&key) {
+            Ok(Some(_)) => return,
+            Ok(None) => {},
+            Err(_) => { tracing::warn!("Could not read processing-notice checkpoint"); return; }
+        }
+        let classification = json!({"kind":if failure {"processing_failure"} else {"processing_ack"}});
+        if self.store.save_delivery_record(&key, &key, json!({"status":"attempted"}), classification.clone()).is_err() {
+            tracing::warn!("Could not reserve processing-notice checkpoint");
+            return;
+        }
+        let notice = OutboundMessage {
+            platform: inbound.platform.clone(), chat_id: inbound.chat_id.clone(),
+            text: if failure { "本次处理暂未完成，请稍后重试。" } else { "收到，正在处理…" }.into(),
+            attachments: Vec::new(), timestamp: crate::models::utc_now_iso(),
+            metadata: serde_json::from_value(json!({"idempotency_key":key,"source":"transport_processing_notice"})).unwrap(),
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1),
+            self.feishu_adapter.send_outbound(notice)).await;
+        let record = match result {
+            Ok(Ok(response)) => json!({"status":if response.get("sent").and_then(Value::as_bool)==Some(true) {"sent"} else {"not_sent"},
+                "provider_message_id":response.get("provider_message_id")}),
+            Ok(Err(_)) => json!({"status":"failed"}),
+            Err(_) => json!({"status":"timed_out"}),
+        };
+        if record["status"] != "sent" { tracing::warn!("Feishu processing notice did not complete; business processing continues"); }
+        let _ = self.store.save_delivery_record(&key, &key, record, classification);
+    }
+
     pub async fn handle_inbound(
         &self,
         adapter_name: &str,
         payload: Value,
     ) -> Result<Value, GatewayError> {
-        let adapter = self
-            .adapter(adapter_name)
+        let adapter = self.adapter(adapter_name)
             .ok_or_else(|| GatewayError::validation(format!("Unknown adapter: {adapter_name}")))?;
-        let mut inbound = adapter.normalize_inbound(payload)?;
+        let inbound = adapter.normalize_inbound(payload)?;
+        let acknowledge = adapter_name == "feishu" && self.task_client.is_some()
+            && !inbound.message_id.trim().is_empty() && processing_notice_needed(&inbound);
+        if acknowledge { self.feishu_transport_notice(&inbound, false).await; }
+        let result = self.handle_normalized_inbound(adapter_name, adapter, inbound.clone()).await;
+        if acknowledge && result.is_err() { self.feishu_transport_notice(&inbound, true).await; }
+        result
+    }
+
+    async fn handle_normalized_inbound(
+        &self,
+        adapter_name: &str,
+        adapter: Arc<dyn PlatformAdapter>,
+        mut inbound: InboundMessage,
+    ) -> Result<Value, GatewayError> {
         let chat_key = format!("{}|{}", inbound.platform, inbound.chat_id);
         let chat_lock = self
             .chat_locks
@@ -921,6 +980,14 @@ fn first_string(payload: &Value, pointers: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
     })
+}
+
+fn processing_notice_needed(inbound: &InboundMessage) -> bool {
+    if !inbound.attachments.is_empty() { return true; }
+    let text = inbound.text.trim().to_lowercase().chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '，' | ',' | '。' | '.' | '？' | '?' | '！' | '!'))
+        .collect::<String>();
+    !text.is_empty() && !matches!(text.as_str(), "你好" | "您好" | "hello" | "hi" | "hey" | "ping" | "测试" | "測試" | "收到" | "好的" | "ok" | "谢谢" | "謝謝" | "thanks" | "thankyou" | "yes" | "no" | "是" | "否")
 }
 
 fn fallback_reply(history: &[ConversationTurn], inbound: &InboundMessage) -> String {
