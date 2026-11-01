@@ -390,69 +390,31 @@ impl FeishuAdapter {
     }
 
     fn normalize_card_action(&self, payload: &Value) -> Result<InboundMessage, GatewayError> {
-        let event_id = payload
-            .pointer("/header/event_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let sender_open_id = payload
-            .pointer("/event/operator/operator_id/open_id")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                payload
-                    .pointer("/event/operator/operator_id/user_id")
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let chat_id = payload
-            .pointer("/event/context/open_chat_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let command = payload
-            .pointer("/event/action/value/command")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                payload
-                    .pointer("/event/action/value/text")
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if chat_id.is_empty() {
-            return Err(GatewayError::validation(
-                "Feishu card action is missing open_chat_id",
-            ));
+        let string = |paths: &[&str]| paths.iter().find_map(|path| payload.pointer(path)
+            .and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())).unwrap_or("").to_string();
+        let event_id = string(&["/header/event_id"]);
+        let user_id = string(&["/event/operator/open_id", "/event/operator/operator_id/open_id"]);
+        let chat_id = string(&["/event/context/open_chat_id"]);
+        let source_message_id = string(&["/event/context/open_message_id"]);
+        let value = payload.pointer("/event/action/value").cloned().unwrap_or(Value::Null);
+        let command = value.get("command").or_else(|| value.get("text"))
+            .and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let structured = value.get("action").and_then(Value::as_str).is_some();
+        if event_id.is_empty() || user_id.is_empty() || chat_id.is_empty() || (!structured && command.is_empty()) {
+            return Err(GatewayError::validation("Feishu card action lacks a stable event, actor, conversation or action"));
         }
-        if sender_open_id.is_empty() {
-            return Err(GatewayError::validation(
-                "Feishu card action is missing operator open_id/user_id",
-            ));
-        }
-        if command.is_empty() {
-            return Err(GatewayError::validation(
-                "Feishu card action is missing command",
-            ));
-        }
+        // Sender allow-list applies to callbacks too. Chat type is checked against
+        // the persisted sent-card receipt in Gateway before a structured action runs.
+        self.enforce_access_policy("p2p", &user_id, "", &[])?;
+        let chat_type = if structured { "unknown" } else { "p2p" };
         Ok(InboundMessage {
-            platform: "feishu".to_string(),
-            chat_id,
-            user_id: sender_open_id,
-            text: command,
-            message_id: event_id,
-            chat_type: "p2p".to_string(),
-            route_key: String::new(),
-            session_id: String::new(),
-            mentions: vec![],
-            attachments: vec![json!({"kind": "card_action", "provider": "feishu"})],
-            metadata: serde_json::Map::new(),
-            timestamp: utc_now_iso(),
-            raw_payload: payload.clone(),
+            platform: "feishu".into(), chat_id, user_id,
+            text: if command.is_empty() { "卡片操作".into() } else { command },
+            message_id: event_id.clone(), chat_type: chat_type.into(),
+            route_key:String::new(),session_id:String::new(),mentions:vec![],
+            attachments:vec![json!({"type":"card_action","kind":"card_action","attachment_id":event_id,
+                "metadata":{"provider":"feishu","source_message_id":source_message_id,"value":value}})],
+            metadata:serde_json::Map::new(),timestamp:utc_now_iso(),raw_payload:payload.clone(),
         })
     }
 
@@ -1477,6 +1439,21 @@ mod tests {
             .unwrap();
         assert_eq!(inbound.text, "继续");
         assert_eq!(inbound.message_id, "evt_card_1");
+    }
+
+    #[test]
+    fn model_card_callback_preserves_official_operator_and_opaque_value() {
+        let adapter=FeishuAdapter::new(settings());
+        let payload=json!({"header":{"event_id":"evt-card","event_type":"card.action.trigger"},
+            "event":{"operator":{"open_id":"ou-admin"},"context":{"open_chat_id":"oc-1","open_message_id":"om-card"},
+                "action":{"value":{"action":"model.select","chooser_id":"opaque-offer","option_id":"opaque-option"}}}});
+        let inbound=adapter.normalize_inbound(payload.clone()).unwrap();
+        assert_eq!(inbound.user_id,"ou-admin");assert_eq!(inbound.chat_type,"unknown");
+        assert_eq!(inbound.attachments[0]["type"],"card_action");
+        assert_eq!(inbound.attachments[0]["metadata"]["value"]["option_id"],"opaque-option");
+        assert_eq!(inbound.attachments[0]["metadata"]["source_message_id"],"om-card");
+        let mut denied=settings();denied.allowed_users=vec!["someone-else".into()];
+        assert!(FeishuAdapter::new(denied).normalize_inbound(payload).is_err());
     }
 
     #[test]

@@ -342,3 +342,29 @@ This remains contract v2.0. No additional conversation protocol is introduced.
 - Incoming websocket events are acknowledged before business processing.
   Platform HTTP operations and audio conversion are bounded to twenty seconds;
   Gate waits at most two hundred seconds for Beacon's business response.
+
+## Model-selection cards extension (2026-11-02)
+
+This is an additive v2.0 extension; the service header remains `2.0`.
+
+- `transport.capabilities.interactive_card` is optional and defaults to false.
+- Beacon may return `delivery_hints` with `kind=native_card`, `fallback=text`, and
+  `metadata.card={schema_version:1,title,subtitle,rows:[{text}],actions:[{label,value}]}`.
+- The card descriptor is platform-neutral. Gate renders it; Gate must not interpret
+  capability, model or runtime selection semantics. Existing `reply.text` remains the text fallback.
+- Feishu callbacks carry `input.parts` entries with `type=card_action`, a stable
+  `attachment_id` anchored to the platform event, and
+  `metadata={provider:"feishu",source_message_id,value}`. The opaque `value` carries
+  Beacon-issued `chooser_id`/`option_id` and an action identifier. It carries no
+  endpoint URL, local file path, credential or trusted principal.
+- Gate preserves the verified operator identity and source conversation, checks its
+  sender policy and persisted source-card receipt, and promptly acknowledges the
+  event before asynchronous business processing. Normal turn card delivery uses
+  the same transport ledger and retry semantics as other messages.
+- Beacon owns the ten-minute chooser, actor/workspace/conversation/configuration
+  binding, authorization, deterministic selection, replay protection and audit.
+  Only an existing bound administrator may modify global model settings.
+- The card and WebUI use the same capability-selection service and persistent state.
+  Result cards are sent as new replies; this extension does not require message editing.
+- Cards without interactive-card capability degrade to useful text; unsupported
+  clients must not be told that a model was switched.

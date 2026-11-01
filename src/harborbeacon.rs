@@ -219,6 +219,7 @@ pub fn build_turn_request(
                 "file": true,
                 "video": incoming.platform != "feishu",
                 "audio": incoming.platform == "feishu",
+                "interactive_card": incoming.platform == "feishu",
             },
             "metadata": metadata,
         },

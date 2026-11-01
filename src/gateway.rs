@@ -102,6 +102,7 @@ impl GatewayService {
         outbound: &OutboundMessage,
         response: &Value,
     ) -> Result<(), GatewayError> {
+        if self.record_card_receipt(outbound,response)? { return Ok(()); }
         if let Some(receipts) = response.get("delivery_receipts").filter(|v| v.is_array()) {
             let mut metadata = self
                 .store
@@ -112,6 +113,41 @@ impl GatewayService {
                 .set_metadata(&outbound.platform, &outbound.chat_id, metadata)?;
         }
         Ok(())
+    }
+
+    fn verify_card_origin(&self, inbound: &mut InboundMessage) -> Result<(), GatewayError> {
+        let part = inbound.attachments.iter().find(|p| p.get("type").and_then(Value::as_str)==Some("card_action"));
+        let Some(part) = part else { return Ok(()); };
+        if part.pointer("/metadata/value/action").and_then(Value::as_str).is_none() { return Ok(()); }
+        let source = part.pointer("/metadata/source_message_id").and_then(Value::as_str).unwrap_or("");
+        let metadata = self.store.load_metadata(&inbound.platform,&inbound.chat_id)?;
+        let receipt = metadata.get("interactive_cards").and_then(|cards|cards.get(source))
+            .ok_or_else(||GatewayError::validation("Card is not a delivered card in this conversation"))?;
+        if receipt.get("user_id").and_then(Value::as_str)!=Some(inbound.user_id.as_str())
+            || receipt.get("chat_type").and_then(Value::as_str)!=Some("p2p") {
+            return Err(GatewayError::validation("Card action does not match its private-chat operator"));
+        }
+        inbound.chat_type="p2p".into();
+        Ok(())
+    }
+
+    fn record_card_receipt(&self, outbound:&OutboundMessage,response:&Value)->Result<bool,GatewayError> {
+        if outbound.metadata.get("feishu_card").is_none() { return Ok(false); }
+        if response.get("sent").and_then(Value::as_bool)!=Some(true) { return Ok(true); }
+        let id=response.pointer("/responses/0/data/message_id").and_then(Value::as_str)
+            .or_else(||response.get("provider_message_id").and_then(Value::as_str)).unwrap_or("");
+        if id.is_empty() { return Ok(true); }
+        let mut metadata=self.store.load_metadata(&outbound.platform,&outbound.chat_id)?;
+        let mut cards=metadata.get("interactive_cards").and_then(Value::as_object).cloned().unwrap_or_default();
+        cards.insert(id.into(),json!({"user_id":outbound.metadata.get("card_user_id"),
+            "chat_type":outbound.metadata.get("card_chat_type"),"at":crate::models::utc_now_iso()}));
+        while cards.len()>32 {
+            let oldest=cards.iter().min_by_key(|(_,v)|v.get("at").and_then(Value::as_str).unwrap_or(""))
+                .map(|(k,_)|k.clone()).unwrap();cards.remove(&oldest);
+        }
+        metadata.insert("interactive_cards".into(),Value::Object(cards));
+        self.store.set_metadata(&outbound.platform,&outbound.chat_id,metadata)?;
+        Ok(true)
     }
 
     async fn feishu_transport_notice(&self, inbound: &InboundMessage, failure: bool) {
@@ -167,7 +203,8 @@ impl GatewayService {
     ) -> Result<Value, GatewayError> {
         let adapter = self.adapter(adapter_name)
             .ok_or_else(|| GatewayError::validation(format!("Unknown adapter: {adapter_name}")))?;
-        let inbound = adapter.normalize_inbound(payload)?;
+        let mut inbound = adapter.normalize_inbound(payload)?;
+        self.verify_card_origin(&mut inbound)?;
         let acknowledge = adapter_name == "feishu" && self.task_client.is_some()
             && !inbound.message_id.trim().is_empty() && processing_notice_needed(&inbound);
         if acknowledge { self.feishu_transport_notice(&inbound, false).await; }
@@ -396,6 +433,11 @@ impl GatewayService {
                     task_result.continuation.unwrap_or(Value::Null),
                 );
                 metadata.insert("next_actions".into(), json!(task_result.next_actions));
+                if let Some(card) = native_card(&task_result.response_payload)? {
+                    metadata.insert("feishu_card".into(),card);
+                    metadata.insert("card_user_id".into(),json!(inbound.user_id));
+                    metadata.insert("card_chat_type".into(),json!(inbound.chat_type));
+                }
                 metadata.insert("native_attachment_count".into(), json!(attachments.len()));
                 (reply_text, attachments, metadata, next_metadata)
             } else {
@@ -982,6 +1024,33 @@ fn first_string(payload: &Value, pointers: &[&str]) -> Option<String> {
     })
 }
 
+fn native_card(payload:&Value)->Result<Option<Value>,GatewayError> {
+    let Some(card)=payload.get("delivery_hints").and_then(Value::as_array).into_iter().flatten()
+        .find(|h|h.get("kind").and_then(Value::as_str)==Some("native_card"))
+        .and_then(|h|h.pointer("/metadata/card")) else {return Ok(None);};
+    if card.get("schema_version").and_then(Value::as_u64)!=Some(1) {
+        return Err(GatewayError::validation("Unsupported neutral card version"));
+    }
+    let title=card.get("title").and_then(Value::as_str).unwrap_or("HarborOS");
+    let subtitle=card.get("subtitle").and_then(Value::as_str).unwrap_or("");
+    let mut elements=vec![json!({"tag":"div","text":{"tag":"plain_text","content":subtitle}})];
+    for row in card.get("rows").and_then(Value::as_array).into_iter().flatten().take(20) {
+        if let Some(text)=row.get("text").and_then(Value::as_str) {
+            elements.push(json!({"tag":"div","text":{"tag":"plain_text","content":text.chars().take(1800).collect::<String>()}}));
+        }
+    }
+    let actions=card.get("actions").and_then(Value::as_array).cloned().unwrap_or_default();
+    if actions.len()>20 {return Err(GatewayError::validation("Too many card actions"));}
+    for chunk in actions.chunks(5) {
+        let buttons=chunk.iter().map(|action|json!({"tag":"button","type":"default",
+            "text":{"tag":"plain_text","content":action.get("label").and_then(Value::as_str).unwrap_or("选择")},
+            "value":action.get("value").cloned().unwrap_or(Value::Null)})).collect::<Vec<_>>();
+        elements.push(json!({"tag":"action","actions":buttons}));
+    }
+    Ok(Some(json!({"config":{"wide_screen_mode":true},"header":{"template":"blue",
+        "title":{"tag":"plain_text","content":title}},"elements":elements})))
+}
+
 fn processing_notice_needed(inbound: &InboundMessage) -> bool {
     if !inbound.attachments.is_empty() { return true; }
     let text = inbound.text.trim().to_lowercase().chars()
@@ -1493,6 +1562,32 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn neutral_model_cards_render_as_buttons_without_business_interpretation() {
+        let payload=json!({"delivery_hints":[{"kind":"native_card","metadata":{"card":{
+            "schema_version":1,"title":"模型","subtitle":"全局设置",
+            "rows":[{"text":"Qwen · 当前运行"}],"actions":[{"label":"选择", "value":{"action":"model.select","chooser_id":"opaque","option_id":"opaque-choice"}}]}}}]});
+        let card=native_card(&payload).unwrap().unwrap();
+        assert_eq!(card["elements"][2]["actions"][0]["value"]["option_id"],"opaque-choice");
+        assert_eq!(card["elements"][1]["text"]["tag"],"plain_text");
+        assert!(native_card(&json!({"reply":{"text":"普通聊天"}})).unwrap().is_none());
+    }
+
+    #[test]
+    fn structured_card_callbacks_require_a_persisted_private_operator_receipt() {
+        let dir=tempdir().unwrap();let mut config=AppConfig::from_env();config.data_dir=dir.path().into();
+        config.state_dir=dir.path().join("state");config.harborbeacon_base_url.clear();
+        let gateway=GatewayService::from_config(&config).unwrap();
+        let mut inbound:InboundMessage=serde_json::from_value(json!({"platform":"feishu","chat_id":"oc-1","user_id":"ou-admin","text":"卡片操作",
+            "attachments":[{"type":"card_action","metadata":{"source_message_id":"om-card","value":{"action":"model.select"}}}]})).unwrap();
+        assert!(gateway.verify_card_origin(&mut inbound).is_err());
+        let outbound=OutboundMessage{platform:"feishu".into(),chat_id:"oc-1".into(),text:"card".into(),attachments:vec![],timestamp:"now".into(),
+            metadata:serde_json::from_value(json!({"feishu_card":{},"card_user_id":"ou-admin","card_chat_type":"p2p"})).unwrap()};
+        gateway.record_previous_delivery(&outbound,&json!({"sent":true,"responses":[{"data":{"message_id":"om-card"}}]})).unwrap();
+        gateway.verify_card_origin(&mut inbound).unwrap();assert_eq!(inbound.chat_type,"p2p");
+        inbound.user_id="other".into();assert!(gateway.verify_card_origin(&mut inbound).is_err());
+    }
 
     #[test]
     fn feishu_media_projection_requires_hints_and_keeps_original_kind() {
