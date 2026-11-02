@@ -370,6 +370,11 @@ This is an additive v2.0 extension; the service header remains `2.0`.
   clients must not be told that a model was switched.
 
 The explicitly approved 2026-11-02 Demo may use a server-owned, expiring
-actor/route/workspace permission grant instead of an identity binding. Gate still
-verifies the callback source and private operator; Beacon still owns all business
-checks and global selection state. This exception does not change platform roles.
+actor/route/workspace permission grant instead of an identity binding. The original
+grant was due to expire at 2026-11-02T23:59:59+08:00; on 2026-11-02 the user explicitly extended
+the same grant through November 11 inclusive, with the current cutoff at
+**2026-11-11T23:59:59+08:00**. The actor, route, workspace and permission scope remain
+unchanged. Gate still verifies the callback source and private operator; Beacon
+still owns all business checks and global selection state. This exception does not
+change platform roles or the ten-minute chooser expiry. Any further extension
+requires explicit user authorization.
