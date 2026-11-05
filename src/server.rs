@@ -81,6 +81,7 @@ pub fn router(state: AppState) -> Router {
     let feishu_path = state.config.feishu.webhook_path.clone();
     Router::new()
         .route("/health", get(health))
+        .route("/api/media/{attachment_id}", get(download_media))
         .route("/", get(root))
         .route("/api/setup/status", get(setup_status))
         .route("/api/gateway/status", get(gateway_status))
@@ -195,6 +196,25 @@ pub fn router(state: AppState) -> Router {
             get(whatsapp_verify).post(whatsapp_webhook),
         )
         .with_state(state)
+}
+
+async fn download_media(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, GatewayError> {
+    let authorization = headers
+        .get("Authorization")
+        .and_then(|s| s.to_str().ok())
+        .unwrap_or("");
+    let (mime, bytes) = state.gateway.read_media(&id, authorization)?;
+    Ok((
+        [
+            (CONTENT_TYPE, mime),
+            (axum::http::header::CACHE_CONTROL, "no-store".into()),
+        ],
+        bytes,
+    ))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {

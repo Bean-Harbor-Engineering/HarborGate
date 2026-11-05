@@ -2,6 +2,11 @@ use crate::adapters::webhook::value_array;
 use crate::adapters::PlatformAdapter;
 use crate::config::FeishuConfig;
 use crate::error::GatewayError;
+use crate::harborbeacon::stable_id;
+use crate::media::{
+    convert_to_opus, fetch_beacon_audio, media_client, normalize_inbound_audio,
+    read_bounded_response, MAX_MEDIA_BYTES,
+};
 use crate::models::{utc_now_iso, InboundMessage, OutboundMessage};
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -40,6 +45,9 @@ pub struct FeishuAdapter {
     http: Client,
     token_cache: Mutex<TokenCache>,
     transport_state: Mutex<TransportState>,
+    media_root: PathBuf,
+    ffmpeg: PathBuf,
+    beacon_origin: String,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +59,21 @@ struct NativeImageAttachment {
 
 impl FeishuAdapter {
     pub fn new(settings: FeishuConfig) -> Self {
+        Self::with_media(
+            settings,
+            PathBuf::from("data/media-outbound"),
+            PathBuf::from("ffmpeg"),
+            "http://127.0.0.1:4174".into(),
+        )
+    }
+
+    pub fn with_media(
+        settings: FeishuConfig,
+        media_root: PathBuf,
+        ffmpeg: PathBuf,
+        beacon_origin: String,
+    ) -> Self {
+        let timeout = settings.timeout_seconds;
         let status = if settings.configured() {
             format!("{}_idle", settings.connection_mode)
         } else {
@@ -58,8 +81,11 @@ impl FeishuAdapter {
         };
         Self {
             settings: RwLock::new(settings),
-            http: Client::new(),
+            http: media_client(timeout),
             token_cache: Mutex::new(TokenCache::default()),
+            media_root,
+            ffmpeg,
+            beacon_origin,
             transport_state: Mutex::new(TransportState {
                 status,
                 ..TransportState::default()
@@ -303,6 +329,25 @@ impl FeishuAdapter {
                 };
                 (text, attachments)
             }
+            "audio" => {
+                let file_key = content
+                    .get("file_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if file_key.is_empty() || message_id.is_empty() {
+                    return Err(GatewayError::validation(
+                        "Feishu audio message is missing file_key or message_id",
+                    ));
+                }
+                (
+                    String::new(),
+                    vec![
+                        json!({"kind":"audio", "provider":"feishu", "resource_key":file_key,
+                    "message_id":message_id, "duration_ms":content.get("duration").and_then(Value::as_u64).unwrap_or(0)}),
+                    ],
+                )
+            }
             other => {
                 return Err(GatewayError::validation(format!(
                     "Unsupported Feishu message_type for Rust lane: {}",
@@ -318,7 +363,7 @@ impl FeishuAdapter {
         if chat_id.is_empty() {
             return Err(GatewayError::validation("Feishu event is missing chat_id"));
         }
-        if text.is_empty() {
+        if text.is_empty() && attachments.is_empty() {
             return Err(GatewayError::validation("Feishu message is empty"));
         }
         self.enforce_access_policy(
@@ -345,66 +390,69 @@ impl FeishuAdapter {
     }
 
     fn normalize_card_action(&self, payload: &Value) -> Result<InboundMessage, GatewayError> {
-        let event_id = payload
-            .pointer("/header/event_id")
+        let string = |paths: &[&str]| {
+            paths
+                .iter()
+                .find_map(|path| {
+                    payload
+                        .pointer(path)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or("")
+                .to_string()
+        };
+        let event_id = string(&["/header/event_id"]);
+        let user_id = string(&[
+            "/event/operator/open_id",
+            "/event/operator/operator_id/open_id",
+        ]);
+        let chat_id = string(&["/event/context/open_chat_id"]);
+        let source_message_id = string(&["/event/context/open_message_id"]);
+        let value = payload
+            .pointer("/event/action/value")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let command = value
+            .get("command")
+            .or_else(|| value.get("text"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim()
             .to_string();
-        let sender_open_id = payload
-            .pointer("/event/operator/operator_id/open_id")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                payload
-                    .pointer("/event/operator/operator_id/user_id")
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let chat_id = payload
-            .pointer("/event/context/open_chat_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let command = payload
-            .pointer("/event/action/value/command")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                payload
-                    .pointer("/event/action/value/text")
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if chat_id.is_empty() {
+        let structured = value.get("action").and_then(Value::as_str).is_some();
+        if event_id.is_empty()
+            || user_id.is_empty()
+            || chat_id.is_empty()
+            || (!structured && command.is_empty())
+        {
             return Err(GatewayError::validation(
-                "Feishu card action is missing open_chat_id",
+                "Feishu card action lacks a stable event, actor, conversation or action",
             ));
         }
-        if sender_open_id.is_empty() {
-            return Err(GatewayError::validation(
-                "Feishu card action is missing operator open_id/user_id",
-            ));
-        }
-        if command.is_empty() {
-            return Err(GatewayError::validation(
-                "Feishu card action is missing command",
-            ));
-        }
+        // Sender allow-list applies to callbacks too. Chat type is checked against
+        // the persisted sent-card receipt in Gateway before a structured action runs.
+        self.enforce_access_policy("p2p", &user_id, "", &[])?;
+        let chat_type = if structured { "unknown" } else { "p2p" };
         Ok(InboundMessage {
-            platform: "feishu".to_string(),
+            platform: "feishu".into(),
             chat_id,
-            user_id: sender_open_id,
-            text: command,
-            message_id: event_id,
-            chat_type: "p2p".to_string(),
+            user_id,
+            text: if command.is_empty() {
+                "卡片操作".into()
+            } else {
+                command
+            },
+            message_id: event_id.clone(),
+            chat_type: chat_type.into(),
             route_key: String::new(),
             session_id: String::new(),
             mentions: vec![],
-            attachments: vec![json!({"kind": "card_action", "provider": "feishu"})],
+            attachments: vec![
+                json!({"type":"card_action","kind":"card_action","attachment_id":event_id,
+                "metadata":{"provider":"feishu","source_message_id":source_message_id,"value":value}}),
+            ],
             metadata: serde_json::Map::new(),
             timestamp: utc_now_iso(),
             raw_payload: payload.clone(),
@@ -466,6 +514,162 @@ impl FeishuAdapter {
         })
     }
 
+    pub async fn prepare_inbound_audio(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(Vec<u8>, u64), GatewayError> {
+        normalize_inbound_audio(&self.ffmpeg, &self.media_root, bytes).await
+    }
+
+    pub async fn download_audio(
+        &self,
+        message_id: &str,
+        file_key: &str,
+    ) -> Result<(String, Vec<u8>), GatewayError> {
+        let token = self.get_tenant_access_token().await?;
+        let settings = self.settings_snapshot();
+        let url = format!(
+            "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
+            settings.base_url.trim_end_matches('/'),
+            urlencoding::encode(message_id),
+            urlencoding::encode(file_key)
+        );
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| self.feishu_error("Feishu audio download did not complete"))?;
+        let mime = response
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("audio/opus")
+            .to_string();
+        if mime.to_ascii_lowercase().contains("application/json") {
+            return Err(self.feishu_error("Feishu returned an error document instead of audio"));
+        }
+        let bytes = read_bounded_response(response).await?;
+        Ok((mime, bytes))
+    }
+
+    fn checkpoint_path(&self, outbound: &OutboundMessage, index: usize) -> Option<PathBuf> {
+        let turn = outbound
+            .metadata
+            .get("delivery_item_key")
+            .or_else(|| outbound.metadata.get("turn_id"))
+            .or_else(|| outbound.metadata.get("idempotency_key"))?
+            .as_str()?;
+        Some(self.media_root.join("deliveries").join(format!(
+            "{}.json",
+            stable_id(
+                "part_",
+                &format!(
+                    "{}|{}|{}|{}",
+                    outbound.platform, outbound.chat_id, turn, index
+                ),
+                40
+            )
+        )))
+    }
+
+    fn cached_part(
+        &self,
+        outbound: &OutboundMessage,
+        index: usize,
+    ) -> Result<Option<Value>, GatewayError> {
+        let Some(path) = self.checkpoint_path(outbound, index) else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&std::fs::read(path)?)?))
+    }
+
+    fn save_part(
+        &self,
+        outbound: &OutboundMessage,
+        index: usize,
+        response: &Value,
+    ) -> Result<(), GatewayError> {
+        if let Some(path) = self.checkpoint_path(outbound, index) {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, serde_json::to_vec(response)?)?;
+        }
+        Ok(())
+    }
+
+    async fn upload_file(
+        &self,
+        path: &Path,
+        file_name: &str,
+        file_type: &str,
+        duration_ms: u64,
+        expected_sha256: Option<&str>,
+        token: &str,
+    ) -> Result<String, GatewayError> {
+        let meta = tokio::fs::metadata(path).await?;
+        if meta.len() == 0 || meta.len() > MAX_MEDIA_BYTES as u64 {
+            return Err(GatewayError::validation(
+                "Feishu file must contain 1 byte to 32 MiB",
+            ));
+        }
+        let bytes = tokio::fs::read(path).await?;
+        if bytes.len() > MAX_MEDIA_BYTES {
+            return Err(GatewayError::validation("Feishu file exceeds 32 MiB"));
+        }
+        if let Some(expected) = expected_sha256 {
+            use sha2::Digest;
+            if format!("{:x}", sha2::Sha256::digest(&bytes)) != expected {
+                return Err(GatewayError::validation(
+                    "Original file changed before delivery",
+                ));
+            }
+        }
+        let part = Part::bytes(bytes).file_name(safe_multipart_filename(file_name));
+        let mut form = Form::new()
+            .text("file_type", file_type.to_string())
+            .text("file_name", safe_multipart_filename(file_name))
+            .part("file", part);
+        if file_type == "opus" {
+            form = form.text("duration", duration_ms.to_string());
+        }
+        let settings = self.settings_snapshot();
+        let response = self
+            .http
+            .post(format!(
+                "{}/open-apis/im/v1/files",
+                settings.base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|_| self.feishu_error("Feishu file upload did not complete"))?;
+        let result = self.decode_openapi_response(response).await?;
+        result
+            .pointer("/data/file_key")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                self.feishu_error("Feishu file upload response did not include file_key")
+            })
+    }
+
+    async fn send_file(
+        &self,
+        outbound: &OutboundMessage,
+        file_key: &str,
+        audio: bool,
+        token: &str,
+    ) -> Result<Value, GatewayError> {
+        self.send_message_body(outbound, json!({"receive_id":outbound.chat_id,
+            "msg_type":if audio {"audio"} else {"file"}, "content":serde_json::to_string(&json!({"file_key":file_key})).unwrap()}), token).await
+    }
+
     async fn get_tenant_access_token(&self) -> Result<String, GatewayError> {
         {
             let cache = self.token_cache.lock().expect("token cache lock poisoned");
@@ -515,9 +719,29 @@ impl FeishuAdapter {
     async fn send_message_body(
         &self,
         outbound: &OutboundMessage,
-        body: Value,
+        mut body: Value,
         token: &str,
     ) -> Result<Value, GatewayError> {
+        if let Some(identity) = outbound
+            .metadata
+            .get("turn_id")
+            .or_else(|| outbound.metadata.get("idempotency_key"))
+            .and_then(Value::as_str)
+        {
+            let part = outbound
+                .metadata
+                .get("native_part_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            body["uuid"] = json!(stable_id(
+                "im_",
+                &format!(
+                    "{}|{}|{}|{}",
+                    outbound.platform, outbound.chat_id, identity, part
+                ),
+                40
+            ));
+        }
         let settings = self.settings_snapshot();
         let reply_to_message_id = outbound
             .metadata
@@ -550,7 +774,15 @@ impl FeishuAdapter {
             .send()
             .await
             .map_err(|err| self.feishu_error(format!("Could not reach Feishu API: {err}")))?;
-        self.decode_openapi_response(response).await
+        let payload = self.decode_openapi_response(response).await?;
+        if payload
+            .pointer("/data/message_id")
+            .and_then(Value::as_str)
+            .is_none_or(|s| s.is_empty())
+        {
+            return Err(self.feishu_error("Feishu send response did not include message_id"));
+        }
+        Ok(payload)
     }
 
     async fn send_text(
@@ -725,36 +957,74 @@ impl PlatformAdapter for FeishuAdapter {
             return Ok(self.protocol_payload(outbound));
         }
 
-        let native_attachments = resolve_native_image_attachments(&outbound)?;
-        let card_payload = outbound
-            .metadata
-            .get("feishu_card")
-            .or_else(|| outbound.metadata.get("structured_payload"))
-            .filter(|value| value.is_object())
-            .cloned();
         let token = self.get_tenant_access_token().await?;
         self.update_state(|state| {
-            state.status = "sending".to_string();
+            state.status = "sending".into();
             state.last_send_status.clear();
             state.last_error.clear();
         });
-
         let mut responses = Vec::new();
         let mut image_keys = Vec::new();
+        let mut native_kinds = Vec::new();
+        let mut native_count = 0;
+        let mut delivery_receipts = Vec::new();
         let result = async {
-            if let Some(card) = card_payload {
-                responses.push(self.send_card(&outbound, card, &token).await?);
-            } else if !outbound.text.trim().is_empty() {
-                responses.push(self.send_text(&outbound, &token).await?);
+            if let Some(cached) = self.cached_part(&outbound, 0)? { responses.push(cached); }
+            else {
+                let response = if let Some(card) = outbound.metadata.get("feishu_card").or_else(|| outbound.metadata.get("structured_payload")).filter(|v| v.as_object().is_some_and(|card| !card.is_empty())) {
+                    Some(self.send_card(&outbound, card.clone(), &token).await?)
+                } else if !outbound.text.trim().is_empty() { Some(self.send_text(&outbound, &token).await?) } else { None };
+                if let Some(response) = response { self.save_part(&outbound, 0, &response)?; responses.push(response); }
             }
-            for attachment in &native_attachments {
-                let image_key = self.upload_image_attachment(attachment, &token).await?;
-                image_keys.push(image_key.clone());
-                responses.push(self.send_image(&outbound, &image_key, &token).await?);
+            let ordered = ordered_native_attachments(&outbound);
+            for (index, artifact) in ordered.iter().enumerate() {
+                let kind = artifact.get("kind").or_else(|| artifact.get("type")).and_then(Value::as_str).unwrap_or("");
+                native_kinds.push(kind.to_string()); native_count += 1;
+                if let Some(cached) = self.cached_part(&outbound, index + 1)? {
+                    delivery_receipts.push(json!({"artifact_id":artifact.get("artifact_id"),"kind":kind,"order":index+1,
+                        "provider_message_id":cached.pointer("/data/message_id"),"status":"sent"}));
+                    responses.push(cached); continue;
+                }
+                let mut part_outbound = outbound.clone();
+                part_outbound.metadata.insert("native_part_index".into(), json!(index + 1));
+                let response = match kind {
+                    "image" => {
+                        let attachment = native_image_attachment_from_value(artifact)?;
+                        let key = self.upload_image_attachment(&attachment, &token).await?;
+                        image_keys.push(key.clone()); self.send_image(&part_outbound, &key, &token).await?
+                    }
+                    "file" => {
+                        let raw = artifact.get("path").and_then(Value::as_str).unwrap_or("");
+                        let path = Path::new(raw);
+                        if !path.is_file() { return Err(GatewayError::validation("Original file is unavailable")); }
+                        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("original");
+                        let key = self.upload_file(path, name, "stream", 0, artifact.pointer("/metadata/sha256").and_then(Value::as_str), &token).await?;
+                        self.send_file(&part_outbound, &key, false, &token).await?
+                    }
+                    "audio" => {
+                        let bytes = fetch_beacon_audio(artifact, &self.beacon_origin).await?;
+                        tokio::fs::create_dir_all(&self.media_root).await?;
+                        let audio_id = stable_id("audio_", &format!("{}|{}|{}", outbound.chat_id, outbound.metadata.get("turn_id").unwrap_or(&Value::Null), index), 32);
+                        let input = self.media_root.join(format!("{audio_id}.wav"));
+                        let output = self.media_root.join(format!("{audio_id}.opus"));
+                        tokio::fs::write(&input, bytes).await?;
+                        let conversion = convert_to_opus(&self.ffmpeg, &input, &output).await;
+                        let _ = tokio::fs::remove_file(&input).await;
+                        conversion?;
+                        let duration = artifact.pointer("/metadata/duration_ms").and_then(Value::as_u64).unwrap_or(0);
+                        let upload = self.upload_file(&output, "reply.opus", "opus", duration, None, &token).await;
+                        let _ = tokio::fs::remove_file(&output).await;
+                        self.send_file(&part_outbound, &upload?, true, &token).await?
+                    }
+                    _ => return Err(GatewayError::validation("Unsupported Feishu native attachment kind")),
+                };
+                self.save_part(&outbound, index + 1, &response)?;
+                delivery_receipts.push(json!({"artifact_id":artifact.get("artifact_id"),"kind":kind,"order":index+1,
+                    "provider_message_id":response.pointer("/data/message_id"),"status":"sent"}));
+                responses.push(response);
             }
             Ok::<(), GatewayError>(())
-        }
-        .await;
+        }.await;
 
         if let Err(error) = result {
             let message = error.message.clone();
@@ -768,6 +1038,26 @@ impl PlatformAdapter for FeishuAdapter {
                 state.last_send_status = "failed".to_string();
                 state.last_error = message;
             });
+            if !responses.is_empty() {
+                let mut warning = outbound.clone();
+                warning.text =
+                    "部分结果发送失败，已送达的文字和图片仍可使用。请重试未送达部分。".into();
+                warning.attachments.clear();
+                warning
+                    .metadata
+                    .insert("native_part_index".into(), json!(999));
+                if self.cached_part(&outbound, 999)?.is_none() {
+                    if let Ok(receipt) = self.send_text(&warning, &token).await {
+                        self.save_part(&outbound, 999, &receipt)?;
+                    }
+                }
+                return Ok(
+                    json!({"platform":"feishu", "chat_id":outbound.chat_id, "sent":false, "partial":true,
+                    "status":"partial", "turn_id":outbound.metadata.get("turn_id"), "delivery_receipts":delivery_receipts,
+                    "responses":responses, "error":{"code":error.code,"message":error.message},
+                    "metadata":{"native_attachment_kinds":native_kinds,"native_attachment_fallback":false}}),
+                );
+            }
             return Err(error);
         }
 
@@ -800,16 +1090,20 @@ impl PlatformAdapter for FeishuAdapter {
             "timestamp": outbound.timestamp,
             "delivery": "feishu",
             "sent": true,
+            "turn_id": outbound.metadata.get("turn_id"),
+            "delivery_receipts": delivery_receipts,
             "message_id": message_id,
             "provider_message_id": message_id,
             "message_ids": message_ids,
             "attachments": outbound.attachments,
             "metadata": {
                 "connection_mode": settings.connection_mode,
-                "attachment_count": native_attachments.len(),
-                "native_image_reply": !native_attachments.is_empty(),
-                "native_attachment_count": native_attachments.len(),
-                "native_attachment_kind": if native_attachments.is_empty() { Value::Null } else { json!("image") },
+                "attachment_count": native_count,
+                "native_image_reply": native_kinds.iter().any(|k| k == "image"),
+                "native_audio_reply": native_kinds.iter().any(|k| k == "audio"),
+                "native_file_reply": native_kinds.iter().any(|k| k == "file"),
+                "native_attachment_count": native_count,
+                "native_attachment_kind": if native_kinds.is_empty() { Value::Null } else { json!(native_kinds.join("+")) },
                 "native_attachment_fallback": false,
                 "feishu_image_keys": image_keys,
             },
@@ -888,15 +1182,31 @@ fn parse_message_content(value: &Value) -> serde_json::Map<String, Value> {
     serde_json::Map::new()
 }
 
-fn resolve_native_image_attachments(
-    outbound: &OutboundMessage,
-) -> Result<Vec<NativeImageAttachment>, GatewayError> {
-    outbound
+fn ordered_native_attachments(outbound: &OutboundMessage) -> Vec<Value> {
+    let mut result: Vec<Value> = outbound
         .attachments
         .iter()
+        .filter(|v| v.get("kind").and_then(Value::as_str) == Some("image"))
         .take(3)
-        .map(native_image_attachment_from_value)
-        .collect()
+        .cloned()
+        .collect();
+    result.extend(
+        outbound
+            .attachments
+            .iter()
+            .filter(|v| v.get("kind").and_then(Value::as_str) == Some("file"))
+            .take(1)
+            .cloned(),
+    );
+    result.extend(
+        outbound
+            .attachments
+            .iter()
+            .filter(|v| v.get("kind").and_then(Value::as_str) == Some("audio"))
+            .take(1)
+            .cloned(),
+    );
+    result
 }
 
 fn native_image_attachment_from_value(
@@ -1170,6 +1480,31 @@ mod tests {
             .unwrap();
         assert_eq!(inbound.text, "继续");
         assert_eq!(inbound.message_id, "evt_card_1");
+    }
+
+    #[test]
+    fn model_card_callback_preserves_official_operator_and_opaque_value() {
+        let adapter = FeishuAdapter::new(settings());
+        let payload = json!({"header":{"event_id":"evt-card","event_type":"card.action.trigger"},
+            "event":{"operator":{"open_id":"ou-admin"},"context":{"open_chat_id":"oc-1","open_message_id":"om-card"},
+                "action":{"value":{"action":"model.select","chooser_id":"opaque-offer","option_id":"opaque-option"}}}});
+        let inbound = adapter.normalize_inbound(payload.clone()).unwrap();
+        assert_eq!(inbound.user_id, "ou-admin");
+        assert_eq!(inbound.chat_type, "unknown");
+        assert_eq!(inbound.attachments[0]["type"], "card_action");
+        assert_eq!(
+            inbound.attachments[0]["metadata"]["value"]["option_id"],
+            "opaque-option"
+        );
+        assert_eq!(
+            inbound.attachments[0]["metadata"]["source_message_id"],
+            "om-card"
+        );
+        let mut denied = settings();
+        denied.allowed_users = vec!["someone-else".into()];
+        assert!(FeishuAdapter::new(denied)
+            .normalize_inbound(payload)
+            .is_err());
     }
 
     #[test]
