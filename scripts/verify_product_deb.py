@@ -12,7 +12,10 @@ import tempfile
 
 def verify(artifact: Path, product_profile: str, version: str) -> None:
     arch = "amd64" if product_profile == "nexus-amd64" else "riscv64"
-    for field, expected in [("Package", "harboros-im-gate"), ("Architecture", arch), ("Version", version)]:
+    artifact_arch = "linux_amd64" if product_profile == "nexus-amd64" else arch
+    if artifact.name != f"harboros-im-gate_{version}_{artifact_arch}.deb":
+        raise ValueError("artifact filename differs from the requested product")
+    for field, expected in [("Package", "harboros-im-gate"), ("Architecture", arch), ("Version", version), ("Provides", "harboros-service-auth-abi (= 1)")]:
         actual = subprocess.check_output(["dpkg-deb", "--field", str(artifact), field], text=True).strip()
         if actual != expected:
             raise ValueError(f"{field} differs from the requested product")
@@ -28,7 +31,8 @@ def verify(artifact: Path, product_profile: str, version: str) -> None:
         glibc = [tuple(map(int, item.split("."))) for item in re.findall(r"GLIBC_([0-9]+\.[0-9]+)", version_info)]
         if glibc and max(glibc) > (2, 36):
             raise ValueError("binary requires GLIBC newer than the pinned Bookworm build image")
-        if (root / "etc/harboros/service-auth").exists() or (root / "etc/default/harboros-beacon-gate").exists():
+        forbidden = [root / "etc/harboros/service-auth", root / "etc/default/harboros-beacon-gate"]
+        if any(path.exists() or path.is_symlink() for path in forbidden):
             raise ValueError("release package contains per-device service credentials")
         service = (root / "usr/lib/systemd/system/harboros-im-gate.service").read_text()
         contract = json.loads((root / "usr/share/harboros/component-contracts/harboros-im-gate.json").read_text())
