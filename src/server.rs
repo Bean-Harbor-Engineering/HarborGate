@@ -237,19 +237,29 @@ async fn root() -> impl IntoResponse {
     }))
 }
 
-async fn setup_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    Json(state.setup.status_payload(host_header(&headers)))
+async fn setup_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(error) = require_nexus_admin(&state, &headers).await {
+        return error.into_response();
+    }
+    Json(state.setup.status_payload(host_header(&headers))).into_response()
 }
 
 async fn prefixed_setup_status(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    if let Err(error) = require_nexus_admin(&state, &headers).await {
+        return error.into_response();
+    }
     Json(
         state
             .setup
             .status_payload_with_prefix(host_header(&headers), HARBOR_GATE_PUBLIC_PREFIX),
     )
+    .into_response()
 }
 
 async fn gateway_status(
@@ -553,7 +563,21 @@ async fn proxy_beacon_request(
             "HarborBeacon proxy service token is not configured",
         ));
     }
-    let principal = if requires_harboros_principal(&method, &target_path) {
+    let nexus_protected = state.config.runtime_profile == "nexus"
+        && !(method == Method::GET
+            && matches!(
+                target_path.split('?').next().unwrap_or(""),
+                "/api/healthz" | "/api/inference/healthz"
+            ));
+    let principal = if nexus_protected {
+        let principal = authenticate_harboros_request(&state, &headers).await?;
+        if !principal.roles.iter().any(|role| role == "FULL_ADMIN") {
+            return Err(harboros_auth_gateway_error(
+                HarborOsAuthFailure::FullAdminRequired,
+            ));
+        }
+        Some(principal)
+    } else if requires_harboros_principal(&method, &target_path) {
         Some(authenticate_proxy_principal(&state, &method, &target_path, &headers).await?)
     } else {
         None
@@ -701,11 +725,15 @@ async fn prefixed_weixin_setup_page(
     ))
 }
 
-async fn weixin_qr_svg(State(state): State<AppState>) -> impl IntoResponse {
-    (
+async fn weixin_qr_svg(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, GatewayError> {
+    require_nexus_admin(&state, &headers).await?;
+    Ok((
         [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
         state.setup.build_weixin_qr_svg(),
-    )
+    ))
 }
 
 async fn admin_im(
@@ -752,8 +780,10 @@ async fn prefixed_admin_im(
 
 async fn configure_feishu(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<impl IntoResponse, GatewayError> {
+    require_nexus_admin(&state, &headers).await?;
     let (status, payload) = state.setup.configure_feishu(payload).await?;
     if status.is_success() {
         maybe_start_configured_feishu_runtime(
@@ -768,21 +798,27 @@ async fn configure_feishu(
 
 async fn weixin_login_start(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, GatewayError> {
+    require_nexus_admin(&state, &headers).await?;
     let (status, payload) = state.setup.start_weixin_login().await?;
     Ok((status, Json(payload)))
 }
 
 async fn weixin_login_status(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, GatewayError> {
+    require_nexus_admin(&state, &headers).await?;
     let (status, payload) = state.setup.poll_weixin_login().await?;
     Ok((status, Json(payload)))
 }
 
 async fn prefixed_weixin_login_start(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, GatewayError> {
+    require_nexus_admin(&state, &headers).await?;
     let (status, payload) = state
         .setup
         .start_weixin_login_with_prefix(HARBOR_GATE_PUBLIC_PREFIX)
@@ -792,7 +828,9 @@ async fn prefixed_weixin_login_start(
 
 async fn prefixed_weixin_login_status(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, GatewayError> {
+    require_nexus_admin(&state, &headers).await?;
     let (status, payload) = state
         .setup
         .poll_weixin_login_with_prefix(HARBOR_GATE_PUBLIC_PREFIX)
@@ -801,6 +839,9 @@ async fn prefixed_weixin_login_status(
 }
 
 async fn weixin_unbind(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(error) = require_nexus_admin(&state, &headers).await {
+        return error.into_response();
+    }
     weixin_unbind_response(state, headers, "/setup/weixin?unbound=1")
 }
 
@@ -808,6 +849,9 @@ async fn prefixed_weixin_unbind(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(error) = require_nexus_admin(&state, &headers).await {
+        return error.into_response();
+    }
     weixin_unbind_response(state, headers, "/api/harbor-gate/setup/weixin?unbound=1")
 }
 
@@ -1259,6 +1303,19 @@ async fn authenticate_proxy_principal(
         roles: vec!["CAMERA_VIEW".to_string()],
         camera_scope: Some(camera_id),
     })
+}
+
+async fn require_nexus_admin(state: &AppState, headers: &HeaderMap) -> Result<(), GatewayError> {
+    if state.config.runtime_profile != "nexus" {
+        return Ok(());
+    }
+    let principal = authenticate_harboros_request(state, headers).await?;
+    if !principal.roles.iter().any(|role| role == "FULL_ADMIN") {
+        return Err(harboros_auth_gateway_error(
+            HarborOsAuthFailure::FullAdminRequired,
+        ));
+    }
+    Ok(())
 }
 
 async fn authenticate_harboros_request(

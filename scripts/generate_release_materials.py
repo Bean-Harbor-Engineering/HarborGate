@@ -62,6 +62,7 @@ def generate_materials(args: argparse.Namespace) -> dict[str, Path]:
     if not COMMIT_RE.fullmatch(args.source_commit):
         raise ValueError("source commit must be a full lowercase Git commit")
 
+    runtime_evidence = "nexus-runtime-evidence-required" if getattr(args, "product_profile", "n2-riscv64") == "nexus-amd64" else "k3-runtime-evidence-required"
     prefix = args.artifact.name.removesuffix(".deb")
     paths = {
         "artifact-set": args.output_dir / f"{prefix}.artifact-set.json",
@@ -71,8 +72,8 @@ def generate_materials(args: argparse.Namespace) -> dict[str, Path]:
         "first-party-rights": (
             args.output_dir / f"{prefix}.first-party-rights-approval.json"
         ),
-        "k3-runtime-evidence": (
-            args.output_dir / f"{prefix}.k3-runtime-evidence-required.json"
+        "k3-runtime-evidence" if runtime_evidence.startswith("k3-") else "nexus-runtime-evidence": (
+            args.output_dir / f"{prefix}.{runtime_evidence}.json"
         ),
         "license-review": args.output_dir / f"{prefix}.license-review.json",
         "provenance": args.output_dir / f"{prefix}.provenance.json",
@@ -215,6 +216,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--product-profile", choices=["nexus-amd64", "n2-riscv64"], default="n2-riscv64")
     parser.add_argument("--architecture", required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)

@@ -186,6 +186,7 @@ async fn audio_normalization_download_and_duplicate_text_use_real_transport() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     config.port = listener.local_addr().unwrap().port();
     config.harborbeacon_base_url = origin.clone();
+    config.harborbeacon_token = "mock-beacon-token-for-formal-transport".into();
     let gateway = Arc::new(GatewayService::from_config(&config).unwrap());
     let router = Router::new()
         .route("/api/media/{id}", get(cached_media))
@@ -407,6 +408,7 @@ async fn restart_pending_audio_replays_identical_turn_to_refresh_expired_capabil
     let (origin, task) = provider(state.clone()).await;
     let mut cfg = config(temp.path(), &origin);
     cfg.harborbeacon_base_url = origin.clone();
+    cfg.harborbeacon_token = "mock-beacon-token-for-formal-transport".into();
     let gateway = GatewayService::from_config(&cfg).unwrap();
     let request = event("text", "om_expired", json!({"text":"retry expired audio"}));
     let initial = gateway
@@ -466,7 +468,7 @@ async fn inbound_opus_is_normalized_to_mono_16k_pcm_wav() {
     .await
     .unwrap();
     assert_eq!(harborgate::media::pcm_wav_duration_ms(&wav), Some(duration));
-    assert!(duration >= 90 && duration <= 110);
+    assert!((90..=110).contains(&duration));
     assert!(wav.starts_with(b"RIFF"));
 }
 
@@ -529,6 +531,12 @@ async fn notification_http_reports_partial_and_retry_only_sends_missing_part() {
         gateway: gateway.clone(),
         setup: Arc::new(harborgate::setup::SetupPortalService::new(cfg, gateway)),
         feishu_websocket_started: Arc::new(AtomicBool::new(false)),
+        harboros_authenticator: Arc::new(
+            harborgate::harboros_auth::MiddlewareHarborOsAuthenticator::default(),
+        ),
+        device_sessions: Arc::new(harborgate::device_session::DeviceSessionStore::new(
+            temp.path().join("device-sessions"),
+        )),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!(

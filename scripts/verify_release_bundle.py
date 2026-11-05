@@ -420,6 +420,8 @@ def verify_third_party_licenses(
 
 
 def verify_bundle(args: argparse.Namespace) -> None:
+    product_profile = getattr(args, "product_profile", "n2-riscv64")
+    runtime_evidence = "nexus-runtime-evidence-required" if product_profile == "nexus-amd64" else "k3-runtime-evidence-required"
     bundle = args.bundle
     prefix = f"{PACKAGE_NAME}_{args.version}_{args.arch}"
     deb_name = f"{prefix}.deb"
@@ -432,7 +434,7 @@ def verify_bundle(args: argparse.Namespace) -> None:
         f"{prefix}.artifact-set.json",
         f"{prefix}.component-contract.json",
         f"{prefix}.first-party-rights-approval.json",
-        f"{prefix}.k3-runtime-evidence-required.json",
+        f"{prefix}.{runtime_evidence}.json",
         f"{prefix}.license-review.json",
         f"{prefix}.provenance.json",
         f"{prefix}.sbom.cdx.json",
@@ -643,6 +645,15 @@ def verify_bundle(args: argparse.Namespace) -> None:
     if contract.get("package") != PACKAGE_NAME or contract.get("source_commit") != source_commit:
         raise ValueError("component contract does not bind the package source")
 
+    if product_profile == "nexus-amd64":
+        if args.arch != "amd64" or contract.get("product_profile") != product_profile:
+            raise ValueError("Nexus bundle uses the wrong architecture or contract lane")
+        if any(item.get("id", "").startswith("harboros.k3.") for item in contract.get("contracts", [])):
+            raise ValueError("Nexus bundle must not claim the N2 contract")
+        runtime = load_canonical_json(bundle / f"{prefix}.{runtime_evidence}.json", "Nexus runtime evidence")
+        if runtime.get("source_commit") != source_commit or runtime.get("product_profile") != product_profile:
+            raise ValueError("Nexus runtime evidence does not bind the product source")
+
     provenance = load_canonical_json(
         bundle / f"{prefix}.provenance.json", "package provenance"
     )
@@ -712,6 +723,7 @@ def main() -> None:
     parser.add_argument("bundle", type=Path)
     parser.add_argument("--arch", required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--product-profile", choices=["nexus-amd64", "n2-riscv64"], default="n2-riscv64")
     parser.add_argument("--require-release-eligible", action="store_true")
     verify_bundle(parser.parse_args())
 

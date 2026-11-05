@@ -118,7 +118,8 @@ async fn setup(
     config.data_dir = root.join("sessions");
     config.state_dir = root.join("state");
     config.harborbeacon_base_url = origin.clone();
-    config.harborbeacon_token.clear();
+    config.harborbeacon_token = "mock-beacon-token-for-formal-transport".into();
+    config.harborbeacon_token = "mock-beacon-token-for-formal-transport".into();
     config.feishu.base_url = origin.clone();
     config.feishu.auth_base_url = origin;
     config.feishu.app_id = "mock-app".into();

@@ -157,8 +157,43 @@ impl AppConfig {
         match self.runtime_profile.as_str() {
             "standard" => Ok(()),
             "k3" => self.validate_k3_runtime(),
-            _ => anyhow::bail!("HARBORGATE_RUNTIME_PROFILE must be standard or k3"),
+            "nexus" => self.validate_nexus_runtime(),
+            _ => anyhow::bail!("HARBORGATE_RUNTIME_PROFILE must be standard, k3 or nexus"),
         }
+    }
+
+    pub fn validate_nexus_runtime(&self) -> anyhow::Result<()> {
+        let mut expected = self.clone();
+        // Credential and loopback rules are shared; Nexus persists on the NAS
+        // system volume instead of the N2 Home bootstrap data mount.
+        anyhow::ensure!(
+            self.state_dir == Path::new("/var/lib/harboros-im-gate"),
+            "Nexus state must use /var/lib/harboros-im-gate"
+        );
+        anyhow::ensure!(
+            self.data_dir == self.state_dir.join("sessions"),
+            "Nexus sessions must stay in its state directory"
+        );
+        anyhow::ensure!(
+            self.weixin.state_dir == self.state_dir.join("weixin"),
+            "Nexus Weixin state must stay in its state directory"
+        );
+        anyhow::ensure!(
+            self.device_session_state_dir == self.state_dir.join("device-sessions"),
+            "Nexus device sessions must stay in its state directory"
+        );
+        anyhow::ensure!(
+            self.feishu_mail.user_token_state_path
+                == "/var/lib/harboros-im-gate/feishu-mail-token.json",
+            "Nexus mail token state must stay in its state directory"
+        );
+        expected.state_dir = "/data/harborgate".into();
+        expected.data_dir = "/data/harborgate/sessions".into();
+        expected.weixin.state_dir = "/data/harborgate/weixin".into();
+        expected.device_session_state_dir = "/data/harborgate/device-sessions".into();
+        expected.feishu_mail.user_token_state_path =
+            "/data/harborgate/feishu-mail-token.json".into();
+        expected.validate_k3_runtime()
     }
 
     pub fn validate_k3_runtime(&self) -> anyhow::Result<()> {
@@ -621,6 +656,21 @@ mod tests {
         config.harborbeacon_token = "b".repeat(64);
         config.harborbeacon_web_api_token = "b".repeat(64);
         config
+    }
+
+    #[test]
+    fn nexus_runtime_uses_nas_state_without_changing_n2_paths() {
+        let mut config = valid_k3_config();
+        config.runtime_profile = "nexus".into();
+        config.state_dir = "/var/lib/harboros-im-gate".into();
+        config.data_dir = "/var/lib/harboros-im-gate/sessions".into();
+        config.weixin.state_dir = "/var/lib/harboros-im-gate/weixin".into();
+        config.device_session_state_dir = "/var/lib/harboros-im-gate/device-sessions".into();
+        config.feishu_mail.user_token_state_path =
+            "/var/lib/harboros-im-gate/feishu-mail-token.json".into();
+        assert!(config.validate_runtime_profile().is_ok());
+        config.state_dir = "/data/harborgate".into();
+        assert!(config.validate_runtime_profile().is_err());
     }
 
     #[test]

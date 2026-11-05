@@ -1409,6 +1409,8 @@ impl GatewayService {
                     "notification_id": notification_id,
                     "trace_id": trace_id,
                     "ok": adapter_response.get("partial").and_then(Value::as_bool) != Some(true),
+                    "sent": adapter_response.get("partial").and_then(Value::as_bool) != Some(true),
+                    "partial": adapter_response.get("partial").and_then(Value::as_bool) == Some(true),
                     "status": if adapter_response.get("partial").and_then(Value::as_bool) == Some(true) { "partial" } else { adapter_response.get("placeholder_status").and_then(Value::as_str).unwrap_or("sent") },
                     "platform": route.get("platform").and_then(Value::as_str).unwrap_or(&adapter_name),
                     "provider_message_id": if provider_message_id.is_empty() { Value::Null } else { json!(provider_message_id) },
@@ -1913,6 +1915,7 @@ impl GatewayService {
                         "provider_client_id": claim.pointer("/item/provider_client_id").cloned().unwrap_or(Value::Null),
                     });
                     if is_feishu {
+                        last_response["sent"] = json!(true);
                         if kind != "text" {
                             receipts.push(json!({"artifact_id":artifact_id,"kind":kind,"status":"sent","provider_message_id":last_response.get("provider_message_id")}));
                         }
@@ -3976,6 +3979,47 @@ mod tests {
         fn profile(&self) -> Value {
             json!({"adapter_name": "item_delivery"})
         }
+    }
+
+    #[test]
+    fn neutral_model_cards_preserve_opaque_choice_and_private_operator_receipt() {
+        let payload = json!({"delivery_hints":[{"kind":"native_card","metadata":{"card":{
+            "schema_version":1,"title":"Models","rows":[{"text":"Qwen"}],
+            "actions":[{"label":"Select","value":{"action":"model.select","chooser_id":"opaque","option_id":"choice"}}]}}}]});
+        let card = native_card(&payload).unwrap().unwrap();
+        assert_eq!(
+            card["elements"][2]["actions"][0]["value"]["option_id"],
+            "choice"
+        );
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url.clear();
+        let gateway = GatewayService::from_config(&config).unwrap();
+        let mut inbound:InboundMessage=serde_json::from_value(json!({"platform":"feishu","chat_id":"private-chat","user_id":"operator","text":"card",
+            "attachments":[{"type":"card_action","metadata":{"source_message_id":"sent-card","value":{"action":"model.select"}}}]})).unwrap();
+        assert!(gateway.verify_card_origin(&mut inbound).is_err());
+        let outbound = OutboundMessage {
+            platform: "feishu".into(),
+            chat_id: "private-chat".into(),
+            text: "card".into(),
+            attachments: vec![],
+            timestamp: "now".into(),
+            metadata: serde_json::from_value(
+                json!({"feishu_card":card,"card_user_id":"operator","card_chat_type":"p2p"}),
+            )
+            .unwrap(),
+        };
+        gateway
+            .record_previous_delivery(
+                &outbound,
+                &json!({"sent":true,"responses":[{"data":{"message_id":"sent-card"}}]}),
+            )
+            .unwrap();
+        gateway.verify_card_origin(&mut inbound).unwrap();
+        inbound.user_id = "other".into();
+        assert!(gateway.verify_card_origin(&mut inbound).is_err());
     }
 
     #[tokio::test]
