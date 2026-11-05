@@ -3,10 +3,13 @@ set -euo pipefail
 
 mode="${1:-prepare}"
 auth_dir="${HARBOR_SERVICE_AUTH_DIR:-/etc/harboros/service-auth}"
-legacy_env_file="${HARBOR_LEGACY_SHARED_ENV_FILE:-/etc/default/harboros-beacon-gate}"
+legacy_default=/etc/default/harboros-beacon-gate
+if [ "$mode" = migrate-n2 ]; then legacy_default=/data/harboros/secrets/beacon-gate.env; fi
+legacy_env_file="${HARBOR_LEGACY_SHARED_ENV_FILE:-$legacy_default}"
 lock_path="$auth_dir/.credential-writer.lock"
 transaction_dir="$auth_dir/.credential-transaction"
 transaction_active=0
+n2_temporary=""
 
 credential_names=(
   gate-to-beacon.send
@@ -253,6 +256,19 @@ validate_initialized_credential_metadata() {
   done
 }
 
+# Old generic images may carry only the two empty previous slots. This is
+# uninitialized state, never permission to repair a partial active token set.
+empty_n2_previous_snapshot() {
+  local directory="$1" name
+  [ "$mode" = migrate-n2 ] || return 1
+  for name in gate-to-beacon.send gate-to-beacon.accept-current beacon-to-gate.send beacon-to-gate.accept-current; do
+    [ ! -e "$directory/$name" ] && [ ! -L "$directory/$name" ] || return 1
+  done
+  for name in gate-to-beacon.accept-previous beacon-to-gate.accept-previous; do
+    [ "$(read_token_file "$directory/$name")" = "" ] || return 1
+  done
+}
+
 validate_complete_credentials() {
   validate_initialized_credential_metadata || return 1
   load_credentials || return 1
@@ -463,7 +479,8 @@ validate_transaction_snapshot_metadata() {
   done
 
   if [ "$transaction_backup_count" -ne 0 ] \
-    && [ "$transaction_backup_count" -ne "${#credential_names[@]}" ]; then
+    && [ "$transaction_backup_count" -ne "${#credential_names[@]}" ] \
+    && ! empty_n2_previous_snapshot "$transaction_dir/backup"; then
     echo "service-auth transaction backup mixes present and absent credentials" >&2
     return 1
   fi
@@ -512,7 +529,7 @@ restore_old_snapshot() {
   if [ "$transaction_backup_count" -eq "${#credential_names[@]}" ]; then
     [ "$existing_count" -eq "${#credential_names[@]}" ] || return 1
     validate_complete_credentials || return 1
-  elif [ "$existing_count" -ne 0 ]; then
+  elif [ "$existing_count" -ne 0 ] && ! empty_n2_previous_snapshot "$auth_dir"; then
     echo "service-auth transaction restore left a partial credential set" >&2
     return 1
   fi
@@ -563,6 +580,7 @@ cleanup() {
   local status="$?"
   trap - EXIT
   set +e
+  if [ -n "$n2_temporary" ]; then rm -f -- "$n2_temporary"; fi
 
   if [ "$status" -ne 0 ] && [ "$transaction_active" -eq 1 ]; then
     if ! recover_transaction; then
@@ -580,7 +598,8 @@ commit_credentials() {
   validate_secure_directory "$auth_dir" "service-auth" || return 1
   inspect_credential_metadata || return 1
   if [ "$existing_count" -ne 0 ] \
-    && [ "$existing_count" -ne "${#credential_names[@]}" ]; then
+    && [ "$existing_count" -ne "${#credential_names[@]}" ] \
+    && ! empty_n2_previous_snapshot "$auth_dir"; then
     echo "refusing to commit over a partial service-auth credential set" >&2
     return 1
   fi
@@ -651,10 +670,105 @@ commit_credentials() {
   remove_transaction
 }
 
+# N2 imports the System Domain's legacy projection as data, never shell code.
+# Its two aliases and canonical sender files must agree before any token write.
+read_n2_legacy() {
+  local line key value index=0 line_count expected_size
+  local keys=(HARBORGATE_BEARER_TOKEN IM_AGENT_SERVICE_TOKEN HARBORBEACON_WEB_API_TOKEN)
+  legacy_g2b=""
+  legacy_b2g=""
+  if [ ! -e "$legacy_env_file" ] && [ ! -L "$legacy_env_file" ]; then return 0; fi
+  validate_legacy_env_file || return 1
+  # Bash read discards NUL bytes. Bind the exact ASCII assignment byte count
+  # before parsing so binary/multiline payloads cannot be normalized silently.
+  line_count="$(wc -l < "$legacy_env_file")"
+  if [ "$line_count" -ne 2 ] && [ "$line_count" -ne 3 ]; then
+    echo "invalid N2 legacy service-auth projection" >&2; return 1
+  fi
+  expected_size=$((${#keys[0]} + ${#keys[1]} + ${#keys[2]} + 3 + 192 + line_count))
+  if [ "$(wc -c < "$legacy_env_file")" -ne "$expected_size" ]; then
+    echo "invalid N2 legacy service-auth projection" >&2; return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$index" -lt 3 ] || { echo "invalid N2 legacy service-auth projection" >&2; return 1; }
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [ "$key" != "${keys[$index]}" ] || ! [[ "$value" =~ ^[a-f0-9]{64}$ ]]; then
+      echo "invalid N2 legacy service-auth projection" >&2
+      return 1
+    fi
+    case "$index" in
+      0) legacy_b2g="$value" ;;
+      1) [ "$value" = "$legacy_b2g" ] || { echo "N2 legacy service-auth aliases differ" >&2; return 1; } ;;
+      2) legacy_g2b="$value" ;;
+    esac
+    index=$((index + 1))
+  done < "$legacy_env_file"
+  if [ "$index" -ne 3 ] || [ "$legacy_b2g" = "$legacy_g2b" ]; then
+    echo "invalid N2 legacy service-auth projection" >&2
+    return 1
+  fi
+}
+
+migrate_n2_credentials() {
+  local direction path count=0
+  read_n2_legacy || return 1
+  if [ "$existing_count" -eq 0 ] || empty_n2_previous_snapshot "$auth_dir"; then
+    if [ -n "$legacy_g2b" ]; then
+      g2b_send="$legacy_g2b"
+      b2g_send="$legacy_b2g"
+    else
+      g2b_send="$(generate_unique_token)"
+      b2g_send="$(generate_unique_token "$g2b_send")"
+    fi
+    g2b_accept="$g2b_send"; b2g_accept="$b2g_send"
+    g2b_previous=""; b2g_previous=""
+    validate_complete_state || return 1
+    commit_credentials
+    return
+  fi
+  # Four-file engineering images, and an interrupted addition of one previous
+  # file, are the only partial states accepted by this explicit migration.
+  g2b_send="$(read_token_file "$auth_dir/gate-to-beacon.send")" || return 1
+  g2b_accept="$(read_token_file "$auth_dir/gate-to-beacon.accept-current")" || return 1
+  b2g_send="$(read_token_file "$auth_dir/beacon-to-gate.send")" || return 1
+  b2g_accept="$(read_token_file "$auth_dir/beacon-to-gate.accept-current")" || return 1
+  g2b_previous=""; b2g_previous=""
+  if [ -e "$auth_dir/gate-to-beacon.accept-previous" ]; then
+    g2b_previous="$(read_token_file "$auth_dir/gate-to-beacon.accept-previous")" || return 1
+  fi
+  if [ -e "$auth_dir/beacon-to-gate.accept-previous" ]; then
+    b2g_previous="$(read_token_file "$auth_dir/beacon-to-gate.accept-previous")" || return 1
+  fi
+  validate_complete_state || return 1
+  if [ -n "$legacy_g2b" ] && { [ "$g2b_send" != "$legacy_g2b" ] || [ "$b2g_send" != "$legacy_b2g" ]; }; then
+    echo "N2 canonical and legacy service-auth credentials differ; migration refused" >&2
+    return 1
+  fi
+  # Publish only missing empty previous slots. The existing four files and
+  # active tokens are never replaced; a crash after either link is retryable.
+  for direction in gate-to-beacon beacon-to-gate; do
+    path="$auth_dir/$direction.accept-previous"
+    if [ ! -e "$path" ]; then
+      n2_temporary="$(mktemp "$auth_dir/.n2-previous.XXXXXXXX")"
+      printf '\n' > "$n2_temporary"
+      chown root:root -- "$n2_temporary"
+      chmod 0600 -- "$n2_temporary"
+      sync_path "$n2_temporary"
+      ln -- "$n2_temporary" "$path"
+      rm -f -- "$n2_temporary"; n2_temporary=""
+      sync_path "$auth_dir"
+      count=$((count + 1))
+      trigger_failpoint "after_n2_previous_$count" 84
+    fi
+  done
+  validate_complete_credentials
+}
+
 case "$mode" in
-  prepare|switch|finalize|rollback|recover) ;;
+  prepare|switch|finalize|rollback|recover|migrate-n2) ;;
   *)
-    echo "usage: ensure-harborbeacon-token-env [prepare|switch|finalize|rollback|recover]" >&2
+    echo "usage: ensure-harborbeacon-token-env [prepare|switch|finalize|rollback|recover|migrate-n2]" >&2
     exit 64
     ;;
 esac
@@ -670,7 +784,7 @@ fi
 
 umask 077
 if [ ! -e "$auth_dir" ] && [ ! -L "$auth_dir" ]; then
-  if [ "$mode" != "prepare" ]; then
+  if [ "$mode" != "prepare" ] && [ "$mode" != "migrate-n2" ]; then
     echo "service-auth credential set is not initialized" >&2
     exit 65
   fi
@@ -694,6 +808,11 @@ recover_transaction
 validate_secure_directory "$auth_dir" "service-auth"
 validate_secure_file "$lock_path" "service-auth credential writer lock"
 inspect_credential_metadata
+
+if [ "$mode" = migrate-n2 ]; then
+  migrate_n2_credentials
+  exit 0
+fi
 
 if [ "$existing_count" -ne 0 ] && [ "$existing_count" -ne "${#credential_names[@]}" ]; then
   echo "incomplete service-auth credential set" >&2

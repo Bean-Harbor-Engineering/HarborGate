@@ -48,8 +48,15 @@ def verify(artifact: Path, product_profile: str, version: str) -> None:
                 raise ValueError("Nexus package dependency lane is incorrect")
             if "StateDirectory=harboros-im-gate" not in service:
                 raise ValueError("Nexus unit does not own its writable state")
-        elif "Environment=HARBORGATE_RUNTIME_PROFILE=k3" not in service or "harboros-system" not in depends:
-            raise ValueError("N2 package lost its Home bootstrap contract")
+        else:
+            if contract.get("product_profile") != "n2-riscv64" or contract.get("release_eligible") is not False:
+                raise ValueError("N2 package identity/qualification is incorrect")
+            if "Environment=HARBORGATE_RUNTIME_PROFILE=k3" not in service or "harboros-n2-service-auth-abi (= 1)" not in depends:
+                raise ValueError("N2 package lost its Home bootstrap/migration contract")
+            if "Requires=harboros-n2-service-auth.service" not in service or "EnvironmentFile=/run/harboros/home.env" not in service:
+                raise ValueError("N2 package lost its credential/bootstrap ordering")
+            if (root / "usr/share/harboros-im-gate/product-profile").read_text().strip() != product_profile:
+                raise ValueError("N2 package is missing its activation receipt")
 
 
 def main() -> None:

@@ -1,0 +1,17 @@
+{
+  "architecture": "riscv64",
+  "candidate_policy": "fail-closed-until-all-evidence-is-signed",
+  "package": "harboros-im-gate",
+  "product_profile": "n2-riscv64",
+  "release_eligible": false,
+  "required_evidence": [
+    "ubuntu-26.04-riscv64-dependency-closure",
+    "ubuntu-26.04-riscv64-dpkg-install",
+    "riscv64-binary-execution",
+    "systemd-bootstrap-ordering",
+    "loopback-8787-health-smoke"
+  ],
+  "schema_version": 1,
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER",
+  "status": "required_external"
+}

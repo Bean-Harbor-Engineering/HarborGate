@@ -40,15 +40,25 @@ dpkg --validate-version "$DEBIAN_VERSION"
   exit 2
 }
 
-product_profile="${HARBOR_GATE_PRODUCT_PROFILE:-n2-riscv64}"
+product_profile="${HARBOR_GATE_PRODUCT_PROFILE:-legacy-k3}"
 case "$product_profile" in
-  n2-riscv64)
+  legacy-k3)
     package_profile_dir=debian/harbornavi-k3
     component_template=debian/component-contract.json.in
     runtime_template=debian/k3-runtime-evidence-required.json.in
     runtime_evidence=k3-runtime-evidence-required
     data_layout=scripts/ensure-data-layout
     recovery_service=debian/harboros-service-auth-recovery.service
+    ;;
+  n2-riscv64)
+    [[ "${target}:${deb_arch}" == riscv64gc-unknown-linux-gnu:riscv64 ]] || { echo "error: N2 requires riscv64" >&2; exit 2; }
+    [[ "$DEBIAN_VERSION" =~ ^0\.2\.0\+n2\.riscv64\.[0-9A-Za-z][0-9A-Za-z.-]*$ ]] || { echo "error: immutable N2 0.2.0 version required" >&2; exit 2; }
+    package_profile_dir=debian/n2
+    component_template=debian/n2/component-contract.json.in
+    runtime_template=debian/n2/runtime-evidence-required.json.in
+    runtime_evidence=n2-runtime-evidence-required
+    data_layout=scripts/ensure-data-layout
+    recovery_service=debian/n2/harboros-service-auth-recovery.service
     ;;
   nexus-amd64)
     [[ "${target}:${deb_arch}" == x86_64-unknown-linux-gnu:amd64 ]] || { echo "error: Nexus requires amd64" >&2; exit 2; }
@@ -95,8 +105,8 @@ artifact_arch="$deb_arch"
 if [[ "$product_profile" == nexus-amd64 ]]; then artifact_arch="linux_amd64"; fi
 material_prefix="harboros-im-gate_${DEBIAN_VERSION}_${artifact_arch}"
 artifact="${out_dir}/${material_prefix}.deb"
-if [[ "$product_profile" == nexus-amd64 ]] && compgen -G "$out_dir/${material_prefix}*" >/dev/null; then
-  echo "error: refusing to replace immutable Nexus release materials" >&2
+if [[ "$product_profile" != legacy-k3 ]] && compgen -G "$out_dir/${material_prefix}*" >/dev/null; then
+  echo "error: refusing to replace immutable product release materials" >&2
   exit 73
 fi
 third_party_material="${out_dir}/${material_prefix}.third-party-licenses.json"
@@ -128,6 +138,11 @@ install -m 0644 "$recovery_service" \
 install -m 0644 "$package_profile_dir/harboros-im-gate.service" \
   "$pkg_dir/usr/lib/systemd/system/harboros-im-gate.service"
 install -m 0644 LICENSE "$pkg_dir/usr/share/doc/harboros-im-gate/copyright"
+if [[ "$product_profile" == n2-riscv64 ]]; then
+  install -d "$pkg_dir/usr/share/harboros-im-gate"
+  printf '%s\n' "$product_profile" > "$pkg_dir/usr/share/harboros-im-gate/product-profile"
+  printf '%s\n' "$source_commit" > "$pkg_dir/usr/share/harboros-im-gate/source-commit"
+fi
 sed \
   -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
@@ -159,7 +174,7 @@ find "$pkg_dir" -print0 | xargs -0 touch --no-dereference --date="@${SOURCE_DATE
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" dpkg-deb \
   --root-owner-group --build --uniform-compression -Zxz -z9 \
   "$pkg_dir" "$artifact"
-if [[ "$product_profile" == nexus-amd64 ]]; then
+if [[ "$product_profile" != legacy-k3 ]]; then
   python3 scripts/verify_product_deb.py "$artifact" --product-profile "$product_profile" --version "$DEBIAN_VERSION"
 fi
 install -m 0644 \
