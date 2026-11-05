@@ -15,6 +15,7 @@ def test_nexus_unit_and_dependency_lane_do_not_inherit_n2_bootstrap():
     control=(ROOT/"debian/nexus/control").read_text()
     assert "HARBORGATE_RUNTIME_PROFILE=nexus" in unit
     assert "StateDirectory=harboros-im-gate" in unit
+    assert "ExecStartPre=/usr/lib/harboros-im-gate/verify-feishu-audio-runtime" in unit
     assert "LoadCredential=gate-to-beacon-send:" in unit
     assert "IM_AGENT_STATE_DIR=/var/lib/harboros-im-gate" in unit
     assert not any(value in unit for value in ["/data/harborgate", "harboros-bootstrap", "/run/harboros/home.env", "4176"])
@@ -53,3 +54,11 @@ def test_product_builder_refuses_an_unknown_profile_before_build(tmp_path):
     result=subprocess.run(["bash",str(ROOT/"scripts/build_harborgate_product_deb.sh")],env=env,capture_output=True,text=True)
     assert result.returncode != 0
     assert "unsupported Gate product profile" in result.stderr
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_nexus_voice_preflight_fails_when_ffmpeg_is_missing():
+    env=dict(__import__("os").environ,HARBORGATE_FFMPEG_BIN="/not-installed/ffmpeg")
+    result=subprocess.run(["bash",str(ROOT/"debian/nexus/verify-feishu-audio-runtime")],env=env,capture_output=True,text=True)
+    assert result.returncode != 0
+    assert "libopus encoder" in result.stderr

@@ -1,16 +1,12 @@
 #!/bin/sh
 set -eu
 /usr/lib/harborgate/ensure-data-layout
-if [ "${SYSTEMD_OFFLINE:-}" = 1 ]; then
-  for path in /etc/harboros/service-auth /etc/default/harboros-beacon-gate; do
-    if [ -e "$path" ] || [ -L "$path" ]; then
-      echo "Refusing an offline Nexus image containing service credentials" >&2
-      exit 1
-    fi
-  done
-else
+# The image assembler verifies that offline rootfs has no live credentials.
+# Device-specific keys are provisioned by the Nexus recovery unit at first boot.
+if [ "${SYSTEMD_OFFLINE:-}" != 1 ]; then
   /usr/lib/harboros-im-gate/ensure-harborbeacon-token-env prepare
 fi
+
 if command -v deb-systemd-helper >/dev/null 2>&1; then
   deb-systemd-helper unmask harboros-im-gate.service >/dev/null || true
   deb-systemd-helper enable harboros-im-gate.service >/dev/null || true

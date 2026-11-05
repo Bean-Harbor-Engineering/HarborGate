@@ -423,7 +423,8 @@ def verify_bundle(args: argparse.Namespace) -> None:
     product_profile = getattr(args, "product_profile", "n2-riscv64")
     runtime_evidence = "nexus-runtime-evidence-required" if product_profile == "nexus-amd64" else "k3-runtime-evidence-required"
     bundle = args.bundle
-    prefix = f"{PACKAGE_NAME}_{args.version}_{args.arch}"
+    artifact_arch = "linux_amd64" if product_profile == "nexus-amd64" else args.arch
+    prefix = f"{PACKAGE_NAME}_{args.version}_{artifact_arch}"
     deb_name = f"{prefix}.deb"
     descriptor_name = f"{deb_name}.release-materials.json"
     manifest_name = f"{deb_name}.materials.sha256"

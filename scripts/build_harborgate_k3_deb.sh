@@ -91,8 +91,10 @@ build_root="$(mktemp -d "${work_parent%/}/harborgate-deb.XXXXXX")"
 trap 'rm -rf -- "$build_root"' EXIT
 pkg_dir="${build_root}/root"
 cargo_target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
-artifact="${out_dir}/harboros-im-gate_${DEBIAN_VERSION}_${deb_arch}.deb"
-material_prefix="harboros-im-gate_${DEBIAN_VERSION}_${deb_arch}"
+artifact_arch="$deb_arch"
+if [[ "$product_profile" == nexus-amd64 ]]; then artifact_arch="linux_amd64"; fi
+material_prefix="harboros-im-gate_${DEBIAN_VERSION}_${artifact_arch}"
+artifact="${out_dir}/${material_prefix}.deb"
 if [[ "$product_profile" == nexus-amd64 ]] && compgen -G "$out_dir/${material_prefix}*" >/dev/null; then
   echo "error: refusing to replace immutable Nexus release materials" >&2
   exit 73
@@ -118,6 +120,9 @@ install -m 0755 "$data_layout" \
   "$pkg_dir/usr/lib/harborgate/ensure-data-layout"
 install -m 0755 debian/ensure-harborbeacon-token-env \
   "$pkg_dir/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env"
+if [[ "$product_profile" == nexus-amd64 ]]; then
+  install -m 0755 debian/nexus/verify-feishu-audio-runtime "$pkg_dir/usr/lib/harboros-im-gate/verify-feishu-audio-runtime"
+fi
 install -m 0644 "$recovery_service" \
   "$pkg_dir/usr/lib/systemd/system/harboros-service-auth-recovery.service"
 install -m 0644 "$package_profile_dir/harboros-im-gate.service" \

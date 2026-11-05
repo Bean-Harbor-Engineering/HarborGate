@@ -22,6 +22,7 @@ LoadCredential=gate-to-beacon-send:/etc/harboros/service-auth/gate-to-beacon.sen
 LoadCredential=beacon-to-gate-accept-current:/etc/harboros/service-auth/beacon-to-gate.accept-current
 LoadCredential=beacon-to-gate-accept-previous:/etc/harboros/service-auth/beacon-to-gate.accept-previous
 EnvironmentFile=-/etc/default/harboros-im-gate
+ExecStartPre=/usr/lib/harboros-im-gate/verify-feishu-audio-runtime
 ExecStart=/usr/bin/harboros-im-gate
 Restart=always
 RestartSec=5s

@@ -1,0 +1,7 @@
+#!/bin/bash
+set -euo pipefail
+ffmpeg_bin="${HARBORGATE_FFMPEG_BIN:-${HARBOR_FFMPEG_BIN:-/usr/bin/ffmpeg}}"
+if ! timeout 5 "$ffmpeg_bin" -hide_banner -encoders 2>/dev/null | grep -E '[[:space:]]libopus[[:space:]]' >/dev/null; then
+  echo "HarborGate voice runtime requires ffmpeg with the libopus encoder" >&2
+  exit 1
+fi
