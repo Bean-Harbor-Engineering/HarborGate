@@ -62,3 +62,37 @@ def test_nexus_voice_preflight_fails_when_ffmpeg_is_missing():
     result=subprocess.run(["bash",str(ROOT/"debian/nexus/verify-feishu-audio-runtime")],env=env,capture_output=True,text=True)
     assert result.returncode != 0
     assert "libopus encoder" in result.stderr
+
+
+def test_explicit_n2_profile_has_its_own_identity_activation_and_bootstrap():
+    unit=(ROOT/'debian/n2/harboros-im-gate.service').read_text()
+    control=(ROOT/'debian/n2/control').read_text()
+    contract=json.loads((ROOT/'debian/n2/component-contract.json.in').read_text())
+    assert contract['product_profile']=='n2-riscv64'
+    assert contract['contracts'][0]['id']=='harboros.n2.gate-v2-transport'
+    assert contract['release_eligible'] is False
+    assert 'HARBORGATE_RUNTIME_PROFILE=k3' in unit
+    assert 'Requires=harboros-n2-service-auth.service' in unit
+    assert 'EnvironmentFile=/run/harboros/home.env' in unit
+    assert 'harboros-n2-service-auth-abi (= 1)' in control
+    postinst=(ROOT/'debian/n2/postinst').read_text()
+    assert 'SYSTEMD_OFFLINE' in postinst and '/usr/bin/harboros-n2-service-auth' in postinst
+    builder=(ROOT/'scripts/build_harborgate_k3_deb.sh').read_text()
+    assert 'HARBOR_GATE_PRODUCT_PROFILE:-legacy-k3' in builder
+    assert 'package_profile_dir=debian/n2' in builder
+    assert '^0\\.2\\.0\\+n2' in builder
+    assert 'refusing to replace immutable product release materials' in builder
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+@pytest.mark.parametrize('version,source',[
+    ('1.1.0+nexus.amd64.1','a'*40),
+    ('1.0.0+n2.riscv64.1','a'*40),
+    ('0.2.0+n2.riscv64.1','main'),
+    ('0.2.0+n2.riscv64.','a'*40),
+])
+def test_n2_wrapper_refuses_cross_lane_or_mutable_identity_before_build(version,source):
+    env=dict(__import__('os').environ,HARBOR_GATE_PRODUCT_PROFILE='n2-riscv64',DEBIAN_VERSION=version,SOURCE_COMMIT=source)
+    result=subprocess.run(['bash',str(ROOT/'scripts/build_harborgate_product_deb.sh')],env=env,capture_output=True,text=True)
+    assert result.returncode != 0
+    assert 'immutable N2 0.2.0 version required' in result.stderr or 'full N2 source commit required' in result.stderr

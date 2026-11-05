@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+/usr/lib/harborgate/ensure-data-layout
+# Image assembly never creates shared per-device credentials, even on reinstall.
+if [ "${SYSTEMD_OFFLINE:-0}" != 1 ]; then
+  /usr/bin/harboros-n2-service-auth
+fi
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+  deb-systemd-helper unmask harboros-im-gate.service >/dev/null || true
+  deb-systemd-helper enable harboros-im-gate.service >/dev/null || true
+fi
+if [ "${SYSTEMD_OFFLINE:-0}" != 1 ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  systemctl daemon-reload
+  systemctl try-restart harboros-im-gate.service
+fi

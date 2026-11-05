@@ -1,0 +1,29 @@
+{
+  "architecture": "riscv64",
+  "blocking_reasons": [
+    "N2 external runtime/dependency closure and physical device acceptance are pending"
+  ],
+  "candidate_status": "internal_candidate",
+  "contracts": [
+    {
+      "capabilities": [
+        "beacon-gate-contract-2.0",
+        "harboros-auth-token-validation",
+        "external-riscv64-runtime-evidence-required",
+        "loopback-only",
+        "per-artifact-video-delivery",
+        "persistent-delivery-retry",
+        "platform-credential-ownership",
+        "service-bearer-redaction"
+      ],
+      "id": "harboros.n2.gate-v2-transport",
+      "version": 1
+    }
+  ],
+  "package": "harboros-im-gate",
+  "product_profile": "n2-riscv64",
+  "release_eligible": false,
+  "runtime_abi": "k3",
+  "schema_version": 1,
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER"
+}

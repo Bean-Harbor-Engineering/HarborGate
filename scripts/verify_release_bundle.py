@@ -420,8 +420,8 @@ def verify_third_party_licenses(
 
 
 def verify_bundle(args: argparse.Namespace) -> None:
-    product_profile = getattr(args, "product_profile", "n2-riscv64")
-    runtime_evidence = "nexus-runtime-evidence-required" if product_profile == "nexus-amd64" else "k3-runtime-evidence-required"
+    product_profile = getattr(args, "product_profile", "legacy-k3")
+    runtime_evidence = "nexus-runtime-evidence-required" if product_profile == "nexus-amd64" else ("n2-runtime-evidence-required" if product_profile == "n2-riscv64" else "k3-runtime-evidence-required")
     bundle = args.bundle
     artifact_arch = "linux_amd64" if product_profile == "nexus-amd64" else args.arch
     prefix = f"{PACKAGE_NAME}_{args.version}_{artifact_arch}"
@@ -655,6 +655,13 @@ def verify_bundle(args: argparse.Namespace) -> None:
         if runtime.get("source_commit") != source_commit or runtime.get("product_profile") != product_profile:
             raise ValueError("Nexus runtime evidence does not bind the product source")
 
+    if product_profile == "n2-riscv64":
+        runtime = load_canonical_json(bundle / f"{prefix}.{runtime_evidence}.json", "N2 runtime evidence")
+        if args.arch != "riscv64" or contract.get("product_profile") != product_profile or runtime.get("product_profile") != product_profile or runtime.get("source_commit") != source_commit:
+            raise ValueError("N2 bundle does not bind the N2 architecture/source/profile")
+        if contract.get("release_eligible") is not False or contract.get("candidate_status") != "internal_candidate":
+            raise ValueError("Unqualified N2 producer must remain an internal candidate")
+
     provenance = load_canonical_json(
         bundle / f"{prefix}.provenance.json", "package provenance"
     )
@@ -724,7 +731,7 @@ def main() -> None:
     parser.add_argument("bundle", type=Path)
     parser.add_argument("--arch", required=True)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--product-profile", choices=["nexus-amd64", "n2-riscv64"], default="n2-riscv64")
+    parser.add_argument("--product-profile", choices=["nexus-amd64", "n2-riscv64", "legacy-k3"], default="legacy-k3")
     parser.add_argument("--require-release-eligible", action="store_true")
     verify_bundle(parser.parse_args())
 

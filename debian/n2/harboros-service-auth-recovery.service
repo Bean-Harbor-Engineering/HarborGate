@@ -1,0 +1,10 @@
+[Unit]
+Description=Recover N2 directional service credentials
+Requires=harboros-n2-service-auth.service
+After=local-fs.target harboros-n2-service-auth.service
+Before=harboros-im-gate.service harboros-beacon.service
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env recover

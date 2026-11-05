@@ -18,12 +18,12 @@ def main() -> None:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--product-profile", choices=["nexus-amd64", "n2-riscv64"], default="n2-riscv64")
+    parser.add_argument("--product-profile", choices=["nexus-amd64", "n2-riscv64", "legacy-k3"], default="legacy-k3")
     parser.add_argument("--arch", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    runtime_evidence = "nexus-runtime-evidence-required" if args.product_profile == "nexus-amd64" else "k3-runtime-evidence-required"
+    runtime_evidence = "nexus-runtime-evidence-required" if args.product_profile == "nexus-amd64" else ("n2-runtime-evidence-required" if args.product_profile == "n2-riscv64" else "k3-runtime-evidence-required")
     names = [
         f"{args.prefix}.deb",
         f"{args.prefix}.deb.sha256",

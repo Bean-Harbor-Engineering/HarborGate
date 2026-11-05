@@ -105,7 +105,7 @@ jobs:
               echo RUST_TARGET=x86_64-unknown-linux-gnu >> "$GITHUB_ENV"
               ;;
             n2-riscv64)
-              [[ "$DEBIAN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+n2\.riscv64\.[0-9A-Za-z][0-9A-Za-z.-]*$ ]]
+              [[ "$DEBIAN_VERSION" =~ ^0\.2\.0\+n2\.riscv64\.[0-9A-Za-z][0-9A-Za-z.-]*$ ]]
               echo DEB_ARCH=riscv64 >> "$GITHUB_ENV"
               echo RUST_TARGET=riscv64gc-unknown-linux-gnu >> "$GITHUB_ENV"
               ;;
@@ -132,7 +132,8 @@ jobs:
         run: |
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           cargo test --locked --all-targets
-          python3 -m pytest scripts/tests/test_supply_chain_scripts.py scripts/tests/test_product_profiles.py scripts/tests/test_release_namespace.py -q
+          cargo test --locked --test token_env_migration -- --ignored
+          python3 -m pytest scripts/tests/test_supply_chain_scripts.py scripts/tests/test_product_profiles.py scripts/tests/test_release_namespace.py scripts/tests/test_n2_service_auth.py -q
           bash scripts/verify_k3_reproducible.sh
           bash scripts/build_harborgate_product_deb.sh
           (cd dist/harborgate-debs && sha256sum --check ./*.sha256)
