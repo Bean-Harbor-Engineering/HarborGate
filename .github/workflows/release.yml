@@ -33,6 +33,57 @@ jobs:
     container:
       image: rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
     steps:
+      - name: Reserve immutable release version including tagless drafts
+        env:
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        # Inline before checkout so old pinned sources also receive this guard.
+        run: |
+          python3 - <<'PY'
+          # BEGIN GATE_RELEASE_NAMESPACE_GUARD
+          import json
+          import os
+          from urllib.error import HTTPError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+
+          def assert_unpublished(repository, version, token, opener=urlopen):
+              headers = {"Accept": "application/vnd.github+json"}
+              if token:
+                  headers["Authorization"] = "Bearer " + token
+              suffix = quote("v" + version, safe="")
+              for endpoint in ("/releases/tags/", "/git/ref/tags/"):
+                  url = "https://api.github.com/repos/" + repository + endpoint + suffix
+                  try:
+                      with opener(Request(url, headers=headers), timeout=20):
+                          raise ValueError("Release/tag version already exists")
+                  except HTTPError as error:
+                      if error.code != 404:
+                          raise ValueError("Could not verify release/tag reservation") from error
+              # A draft may reserve a version without creating its Git tag.
+              for page in range(1, 101):
+                  url = f"https://api.github.com/repos/{repository}/releases?per_page=100&page={page}"
+                  try:
+                      with opener(Request(url, headers=headers), timeout=20) as response:
+                          releases = json.load(response)
+                  except (HTTPError, ValueError) as error:
+                      raise ValueError("Could not inspect release inventory") from error
+                  if not isinstance(releases, list) or not all(isinstance(item, dict) for item in releases):
+                      raise ValueError("Invalid release inventory")
+                  if any(item.get("tag_name") == "v" + version for item in releases):
+                      raise ValueError("Draft/release version already exists")
+                  if len(releases) < 100:
+                      return
+              raise ValueError("Release inventory exceeds reservation-check limit")
+
+
+          if __name__ == "__main__":
+              assert_unpublished(os.environ["REPOSITORY"], os.environ["VERSION"], os.environ["GH_TOKEN"])
+          # END GATE_RELEASE_NAMESPACE_GUARD
+          PY
       - name: Checkout the pinned source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -81,7 +132,7 @@ jobs:
         run: |
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           cargo test --locked --all-targets
-          python3 -m pytest scripts/tests/test_supply_chain_scripts.py scripts/tests/test_product_profiles.py -q
+          python3 -m pytest scripts/tests/test_supply_chain_scripts.py scripts/tests/test_product_profiles.py scripts/tests/test_release_namespace.py -q
           bash scripts/verify_k3_reproducible.sh
           bash scripts/build_harborgate_product_deb.sh
           (cd dist/harborgate-debs && sha256sum --check ./*.sha256)
