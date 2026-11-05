@@ -1205,11 +1205,18 @@ fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
     let server = fs::read_to_string(root.join("src/server.rs")).unwrap();
 
     assert!(ci.contains("debian/build-amd64-package"));
-    assert!(workflow.contains("scripts/build_harborgate_k3_deb.sh"));
+    assert!(workflow.contains("scripts/build_harborgate_product_deb.sh"));
+    let product_builder =
+        fs::read_to_string(root.join("scripts/build_harborgate_product_deb.sh")).unwrap();
+    assert!(product_builder.contains("build_harborgate_k3_deb.sh"));
+    assert!(product_builder.contains("nexus-amd64"));
+    assert!(product_builder.contains("n2-riscv64"));
     let k3_builder = fs::read_to_string(root.join("scripts/build_harborgate_k3_deb.sh")).unwrap();
     assert!(k3_builder.contains("debian/ensure-harborbeacon-token-env"));
     assert!(k3_builder.contains("debian/harboros-service-auth-recovery.service"));
-    assert!(k3_builder.contains("debian/harbornavi-k3/postinst"));
+    assert!(k3_builder.contains("package_profile_dir=debian/harbornavi-k3"));
+    assert!(k3_builder.contains("$package_profile_dir/postinst"));
+    assert!(k3_builder.contains("package_profile_dir=debian/nexus"));
     let k3_postinst = fs::read_to_string(root.join("debian/harbornavi-k3/postinst")).unwrap();
     assert!(k3_postinst.contains("ensure-harborbeacon-token-env prepare"));
     for mode in ["switch", "finalize", "rollback"] {

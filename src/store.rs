@@ -227,6 +227,21 @@ impl FileSessionStore {
         Ok(routes.get(route_key).cloned())
     }
 
+    pub fn load_inbound_record(&self, key: &str) -> Result<Option<Value>> {
+        let _guard = self.lock.lock().expect("session store lock poisoned");
+        Ok(self
+            .load_shared_map_unlocked("_inbound.json")?
+            .get(key)
+            .cloned())
+    }
+
+    pub fn save_inbound_record(&self, key: &str, record: Value) -> Result<()> {
+        let _guard = self.lock.lock().expect("session store lock poisoned");
+        let mut records = self.load_shared_map_unlocked("_inbound.json")?;
+        records.insert(key.to_string(), record);
+        self.write_shared_map_unlocked("_inbound.json", &records)
+    }
+
     pub fn load_delivery_record(&self, idempotency_key: &str) -> Result<Option<Value>> {
         if idempotency_key.trim().is_empty() {
             return Ok(None);

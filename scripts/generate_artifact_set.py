@@ -18,17 +18,19 @@ def main() -> None:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--product-profile", choices=["nexus-amd64", "n2-riscv64"], default="n2-riscv64")
     parser.add_argument("--arch", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
+    runtime_evidence = "nexus-runtime-evidence-required" if args.product_profile == "nexus-amd64" else "k3-runtime-evidence-required"
     names = [
         f"{args.prefix}.deb",
         f"{args.prefix}.deb.sha256",
         f"{args.prefix}.LICENSE",
         f"{args.prefix}.component-contract.json",
         f"{args.prefix}.first-party-rights-approval.json",
-        f"{args.prefix}.k3-runtime-evidence-required.json",
+        f"{args.prefix}.{runtime_evidence}.json",
         f"{args.prefix}.license-review.json",
         f"{args.prefix}.provenance.json",
         f"{args.prefix}.sbom.cdx.json",

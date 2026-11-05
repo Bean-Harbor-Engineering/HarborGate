@@ -6,6 +6,7 @@ pub mod error;
 pub mod gateway;
 pub mod harborbeacon;
 pub mod harboros_auth;
+pub mod media;
 pub mod models;
 mod navi_fleet;
 pub mod runtime;

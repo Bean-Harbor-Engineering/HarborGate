@@ -191,8 +191,14 @@ impl HarborBeaconTaskClient {
             .get("continuation")
             .filter(|value| value.is_object())
             .cloned();
-        let request_payload =
+        let mut request_payload =
             build_turn_request(incoming, conversation_handle.as_deref(), continuation);
+        if let Some(previous) = session_metadata
+            .get("previous_delivery")
+            .filter(|v| v.is_object())
+        {
+            request_payload["transport"]["metadata"]["previous_delivery"] = previous.clone();
+        }
         let response_payload = self.post_json(&request_payload).await?;
         Ok(map_turn_response(&request_payload, response_payload))
     }
@@ -908,7 +914,10 @@ pub fn build_turn_request(
                 "text": true,
                 "image": true,
                 "file": true,
-                "video": true,
+                "video": incoming.platform != "feishu",
+                "audio": incoming.platform == "feishu",
+                "interactive_card": incoming.platform == "feishu",
+                "interactive_card": incoming.platform == "feishu",
             },
             "metadata": metadata,
         },

@@ -338,3 +338,63 @@ v2.0 is release-ready only when:
   HarborBeacon.
 - HarborCloud entitlement, HarborLink MQTT, HarborDock remote home/camera
   control, and WebUI display state remain outside this IM contract.
+
+## Feishu voice/media transport extension (2026-10-31)
+
+This remains contract v2.0. No additional conversation protocol is introduced.
+
+- Feishu advertises `transport.capabilities.audio=true`; Weixin does not. The
+  existing text/image/file capabilities retain their meanings.
+- An audio `input.parts` item uses the existing attachment descriptor fields:
+  `attachment_id`, `type=audio`, `name`, `mime_type`, `size_bytes`, `download`,
+  and `metadata.duration_ms`. Gate downloads the platform resource itself.
+- `download` uses `mode=proxy`, `method=GET`, `url`, a single-file opaque bearer
+  capability in `headers.Authorization`, `auth.type=bearer`, `expires_at`, and
+  `max_size_bytes=33554432`. The Gate endpoint is `/api/media/{attachment_id}`.
+  Capabilities expire after ten minutes and cannot read another attachment.
+  Platform credentials must never appear in this descriptor. Inbound voice is
+  normalized by Gate to mono 16 kHz PCM WAV with measured duration. Pending
+  delivery replays its original turn to refresh expired speech capabilities;
+  Beacon reuses the cached business answer and generated speech.
+- Beacon-generated speech uses `kind=audio`, stable `artifact_id`,
+  `mime_type=audio/wav`, `url`, and `metadata.download` with the same download
+  descriptor fields. Gate fetches only the configured loopback Beacon origin
+  and `/api/web/media/` prefix, with redirects disabled.
+- A `native_audio` hint refers to that audio artifact; its fallback is text.
+  Gate converts speech to Opus, uploads it, and sends a native Feishu audio
+  message. An original photo requested as a file uses `kind=file` and a
+  `native_file` hint, preserving file bytes rather than using image compression.
+- Feishu delivery order is text/card, at most three ordered images, an optional
+  original file, then optional audio. Per-part provider receipts are Gate-owned
+  delivery state. A partial send is explicitly reported and retries skip parts
+  already sent; the same platform message must not create a new business turn.
+- Incoming websocket events are acknowledged before business processing.
+  Platform HTTP operations and audio conversion are bounded to twenty seconds;
+  Gate waits at most two hundred seconds for Beacon's business response.
+
+## Model-selection cards extension (2026-11-02)
+
+This is an additive v2.0 extension; the service header remains `2.0`.
+
+- `transport.capabilities.interactive_card` is optional and defaults to false.
+- Beacon may return `delivery_hints` with `kind=native_card`, `fallback=text`, and
+  `metadata.card={schema_version:1,title,subtitle,rows:[{text}],actions:[{label,value}]}`.
+- The card descriptor is platform-neutral. Gate renders it; Gate must not interpret
+  capability, model or runtime selection semantics. Existing `reply.text` remains the text fallback.
+- Feishu callbacks carry `input.parts` entries with `type=card_action`, a stable
+  `attachment_id` anchored to the platform event, and
+  `metadata={provider:"feishu",source_message_id,value}`. The opaque `value` carries
+  Beacon-issued `chooser_id`/`option_id` and an action identifier. It carries no
+  endpoint URL, local file path, credential or trusted principal.
+- Gate preserves the verified operator identity and source conversation, checks its
+  sender policy and persisted source-card receipt, and promptly acknowledges the
+  event before asynchronous business processing. Normal turn card delivery uses
+  the same transport ledger and retry semantics as other messages.
+- Beacon owns the ten-minute chooser, actor/workspace/conversation/configuration
+  binding, authorization, deterministic selection, replay protection and audit.
+  Only an existing bound administrator may modify global model settings.
+- The card and WebUI use the same capability-selection service and persistent state.
+  Result cards are sent as new replies; this extension does not require message editing.
+- Cards without interactive-card capability degrade to useful text; unsupported
+  clients must not be told that a model was switched.
+

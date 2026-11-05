@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+/usr/lib/harborgate/ensure-data-layout
+# The image assembler verifies that offline rootfs has no live credentials.
+# Device-specific keys are provisioned by the Nexus recovery unit at first boot.
+if [ "${SYSTEMD_OFFLINE:-}" != 1 ]; then
+  /usr/lib/harboros-im-gate/ensure-harborbeacon-token-env prepare
+fi
+
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+  deb-systemd-helper unmask harboros-im-gate.service >/dev/null || true
+  deb-systemd-helper enable harboros-im-gate.service >/dev/null || true
+fi
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  systemctl daemon-reload
+  systemctl try-restart harboros-im-gate.service
+fi
