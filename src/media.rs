@@ -5,6 +5,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,6 +20,8 @@ struct CachedMedia {
     name: String,
     size_bytes: usize,
     duration_ms: u64,
+    #[serde(default)]
+    image_metadata: Option<Value>,
 }
 
 pub struct MediaCache {
@@ -63,13 +67,13 @@ impl MediaCache {
 
     fn to_descriptor(&self, id: &str, entry: &CachedMedia) -> Value {
         json!({
-            "attachment_id": id, "type": "audio", "name": entry.name,
+            "attachment_id": id, "type": if entry.image_metadata.is_some() { "image" } else { "audio" }, "name": entry.name,
             "mime_type": entry.mime_type, "size_bytes": entry.size_bytes,
             "download": {"mode": "proxy", "url": format!("{}/api/media/{id}", self.origin),
                 "method": "GET", "headers": {"Authorization": format!("Bearer {}", entry.token)},
                 "auth": {"type": "bearer"}, "expires_at": entry.expires_at.to_rfc3339(),
                 "max_size_bytes": MAX_MEDIA_BYTES},
-            "metadata": {"duration_ms": entry.duration_ms}
+            "metadata": entry.image_metadata.clone().unwrap_or_else(|| json!({"duration_ms": entry.duration_ms}))
         })
     }
 
@@ -109,6 +113,38 @@ impl MediaCache {
             },
             size_bytes: bytes.len(),
             duration_ms,
+            image_metadata: None,
+        };
+        std::fs::write(path, bytes)?;
+        std::fs::write(manifest, serde_json::to_vec(&entry)?)?;
+        Ok(self.to_descriptor(id, &entry))
+    }
+
+    /// Validate decoded content, but preserve the provider's original JPEG/PNG bytes.
+    pub fn store_image(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        source_message_id: &str,
+    ) -> Result<Value, GatewayError> {
+        if let Some(existing) = self.descriptor(id)? {
+            return Ok(existing);
+        }
+        let (mime, extension, width, height) = validate_image(bytes)?;
+        self.cleanup()?;
+        let (manifest, path) = self.paths(id)?;
+        let entry = CachedMedia {
+            token: format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()),
+            expires_at: Utc::now() + ChronoDuration::minutes(10),
+            mime_type: mime.into(),
+            name: format!("image.{extension}"),
+            size_bytes: bytes.len(),
+            duration_ms: 0,
+            image_metadata: Some(json!({
+                "sha256": format!("{:x}", Sha256::digest(bytes)),
+                "width": width, "height": height,
+                "provider": "feishu", "source_message_id": source_message_id
+            })),
         };
         std::fs::write(path, bytes)?;
         std::fs::write(manifest, serde_json::to_vec(&entry)?)?;
@@ -160,6 +196,33 @@ impl MediaCache {
         }
         Ok(())
     }
+}
+
+fn validate_image(bytes: &[u8]) -> Result<(&'static str, &'static str, u32, u32), GatewayError> {
+    if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES {
+        return Err(GatewayError::validation("Image must contain 1 byte to 32 MiB"));
+    }
+    let unsupported = || GatewayError::validation("Image could not be decoded; send a valid JPEG or PNG image");
+    let format = image::guess_format(bytes).map_err(|_| unsupported())?;
+    let (mime, extension) = match format {
+        image::ImageFormat::Jpeg => ("image/jpeg", "jpg"),
+        image::ImageFormat::Png => ("image/png", "png"),
+        _ => return Err(unsupported()),
+    };
+    let (width, height) = image::ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions().map_err(|_| unsupported())?;
+    if width == 0 || height == 0 || width > 16384 || height > 16384
+        || u64::from(width) * u64::from(height) > 64_000_000 {
+        return Err(GatewayError::validation("Image exceeds the 64 megapixel or 16384 pixel edge decoding limit"));
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().map_err(|_| unsupported())?;
+    Ok((mime, extension, width, height))
 }
 
 pub fn media_client(seconds: u64) -> Client {
@@ -391,6 +454,28 @@ pub async fn convert_to_opus(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_validation_rejects_large_dimensions_and_payloads_before_decoding() {
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        for (width, height) in [(8001_u32, 8000_u32), (16385, 1)] {
+            let mut bytes = encoded.get_ref().clone();
+            bytes[16..20].copy_from_slice(&width.to_be_bytes());
+            bytes[20..24].copy_from_slice(&height.to_be_bytes());
+            // Recompute IHDR CRC so the fixture tests dimensions, not corruption.
+            let mut crc = !0_u32;
+            for byte in &bytes[12..29] {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 { crc = (crc >> 1) ^ (0xedb88320_u32 & (0_u32.wrapping_sub(crc & 1))); }
+            }
+            bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+            assert!(validate_image(&bytes).unwrap_err().message.contains("decoding limit"));
+        }
+        assert!(validate_image(&vec![0; MAX_MEDIA_BYTES + 1]).unwrap_err().message.contains("32 MiB"));
+        let mut corrupted = encoded.into_inner();
+        corrupted.truncate(corrupted.len() / 2);
+        assert!(validate_image(&corrupted).unwrap_err().message.contains("JPEG or PNG"));
+    }
     #[test]
     fn capability_is_stable_and_cannot_read_another_file() {
         let dir = tempfile::tempdir().unwrap();

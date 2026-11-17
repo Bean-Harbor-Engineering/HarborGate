@@ -150,7 +150,8 @@ impl GatewayService {
         Ok(true)
     }
 
-    async fn feishu_transport_notice(&self, inbound: &InboundMessage, failure: bool) {
+    async fn feishu_transport_notice(&self, inbound: &InboundMessage, error: Option<&GatewayError>) {
+        let failure = error.is_some();
         let identity = format!("{}|{}|{}", inbound.platform, inbound.chat_id, inbound.message_id);
         let key = stable_id(if failure { "processing_failure_" } else { "processing_ack_" }, &identity, 40);
         let notice_lock = self.chat_locks.lock().expect("chat locks poisoned")
@@ -180,7 +181,10 @@ impl GatewayService {
         }
         let notice = OutboundMessage {
             platform: inbound.platform.clone(), chat_id: inbound.chat_id.clone(),
-            text: if failure { "本次处理暂未完成，请稍后重试。" } else { "收到，正在处理…" }.into(),
+            text: if error.is_some_and(|err| err.code == "VALIDATION_ERROR")
+                && inbound.attachments.iter().any(|part| part["kind"] == "image") {
+                "图片无法读取，请重新发送有效的 JPEG 或 PNG；文件不超过 32 MiB，像素不超过 6400 万，单边不超过 16384 像素。"
+            } else if failure { "本次处理暂未完成，请稍后重试。" } else { "收到，正在处理…" }.into(),
             attachments: Vec::new(), timestamp: crate::models::utc_now_iso(),
             metadata: serde_json::from_value(json!({"idempotency_key":key,"source":"transport_processing_notice"})).unwrap(),
         };
@@ -207,9 +211,9 @@ impl GatewayService {
         self.verify_card_origin(&mut inbound)?;
         let acknowledge = adapter_name == "feishu" && self.task_client.is_some()
             && !inbound.message_id.trim().is_empty() && processing_notice_needed(&inbound);
-        if acknowledge { self.feishu_transport_notice(&inbound, false).await; }
+        if acknowledge { self.feishu_transport_notice(&inbound, None).await; }
         let result = self.handle_normalized_inbound(adapter_name, adapter, inbound.clone()).await;
-        if acknowledge && result.is_err() { self.feishu_transport_notice(&inbound, true).await; }
+        if acknowledge && result.is_err() { self.feishu_transport_notice(&inbound, result.as_ref().err()).await; }
         result
     }
 
@@ -293,7 +297,12 @@ impl GatewayService {
         }
         if adapter_name == "feishu" && existing.as_ref().and_then(|r| r.get("prepared")).is_none() {
             for attachment in &mut inbound.attachments {
-                if attachment.get("kind").and_then(Value::as_str) != Some("audio") {
+                let kind = attachment
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if kind != "audio" && kind != "image" {
                     continue;
                 }
                 let id = stable_id(
@@ -311,15 +320,29 @@ impl GatewayService {
                         .get("resource_key")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let (source_mime, bytes) = self
-                        .feishu_adapter
-                        .download_audio(&inbound.message_id, key)
-                        .await?;
-                    let (wav, duration) = self.feishu_adapter.prepare_inbound_audio(&bytes).await?;
-                    let mut descriptor =
-                        self.media_cache.store(&id, &wav, "audio/wav", duration)?;
-                    descriptor["metadata"]["source_mime_type"] = json!(source_mime);
-                    descriptor
+                    if kind == "image" {
+                        let bytes = self
+                            .feishu_adapter
+                            .download_image(&inbound.message_id, key)
+                            .await?;
+                        let cache = self.media_cache.clone();
+                        let message_id = inbound.message_id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            cache.store_image(&id, &bytes, &message_id)
+                        })
+                        .await
+                        .map_err(|_| GatewayError::infrastructure("Image validation did not complete"))??
+                    } else {
+                        let (source_mime, bytes) = self
+                            .feishu_adapter
+                            .download_audio(&inbound.message_id, key)
+                            .await?;
+                        let (wav, duration) = self.feishu_adapter.prepare_inbound_audio(&bytes).await?;
+                        let mut descriptor =
+                            self.media_cache.store(&id, &wav, "audio/wav", duration)?;
+                        descriptor["metadata"]["source_mime_type"] = json!(source_mime);
+                        descriptor
+                    }
                 };
             }
             if let Some(key) = &replay_key {

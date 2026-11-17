@@ -23,6 +23,7 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 ecb = { version = "0.1", features = ["alloc"] }
 futures-util = "0.3"
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
 md5 = "0.7"
 mime_guess = "2"
 prost = "0.13"

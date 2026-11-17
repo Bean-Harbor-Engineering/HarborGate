@@ -368,3 +368,32 @@ This is an additive v2.0 extension; the service header remains `2.0`.
   Result cards are sent as new replies; this extension does not require message editing.
 - Cards without interactive-card capability degrade to useful text; unsupported
   clients must not be told that a model was switched.
+
+## Feishu inbound image transport (2026-11-17)
+
+This uses the existing v2.0 `input.parts` attachment shape; no v1.5 path or new
+top-level contract fields are introduced.
+
+- A private image message has empty `input.text` and one attachment with
+  `attachment_id`, `type=image`, `name=image.jpg|image.png`, `mime_type`,
+  `size_bytes`, `download`, and `metadata`.
+- Gate downloads the message-bound Feishu resource with `type=image`, using
+  Gate-owned platform credentials. It validates decoded JPEG/PNG content and
+  preserves the exact downloaded bytes. MIME and size come from actual content,
+  not the provider's HTTP MIME claim. Unsupported or corrupt formats are rejected
+  with a user-facing request for a valid JPEG/PNG.
+- `metadata` contains lowercase hexadecimal `sha256` of those original bytes,
+  `width`, `height`, `provider=feishu`, and `source_message_id`. Dimensions are
+  encoded dimensions, before any EXIF orientation applied by Beacon.
+- `download` has the same proxy GET, single-file bearer capability, loopback URL,
+  expiry and 32 MiB limit as audio. The capability expires after ten minutes.
+  Gate accepts at most 64 million pixels, a 16384 pixel edge, and a decoder
+  allocation limit of 512 MiB. Platform credentials and raw resource keys are
+  never included in the attachment descriptor.
+- Duplicate delivery and restart reuse the prepared attachment and original
+  turn. An expired inbound capability is not silently renewed. Beacon must fetch
+  and verify the original during the first accepted turn and own any longer-lived
+  conversation context, derived inference image, or user-authorized library save.
+- Gate owns transport validation only. Beacon owns image interpretation,
+  follow-up turns, save approval and library/search behavior. Original bytes must
+  not be confused with any resized inference copy.

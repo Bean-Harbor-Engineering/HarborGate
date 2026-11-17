@@ -316,18 +316,18 @@ impl FeishuAdapter {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let text = "飞书图片消息".to_string();
-                let attachments = if image_key.is_empty() {
-                    vec![]
-                } else {
-                    vec![json!({
-                        "kind": "image",
-                        "resource_key": image_key,
-                        "provider": "feishu",
-                        "message_id": message_id,
-                    })]
-                };
-                (text, attachments)
+                if image_key.is_empty() || message_id.is_empty() {
+                    return Err(GatewayError::validation(
+                        "Feishu image message is missing image_key or message_id",
+                    ));
+                }
+                let attachments = vec![json!({
+                    "kind": "image",
+                    "resource_key": image_key,
+                    "provider": "feishu",
+                    "message_id": message_id,
+                })];
+                (String::new(), attachments)
             }
             "audio" => {
                 let file_key = content
@@ -485,13 +485,42 @@ impl FeishuAdapter {
         message_id: &str,
         file_key: &str,
     ) -> Result<(String, Vec<u8>), GatewayError> {
-        let token = self.get_tenant_access_token().await?;
+        self.download_resource(message_id, file_key, "file").await
+    }
+
+    pub async fn download_image(
+        &self,
+        message_id: &str,
+        image_key: &str,
+    ) -> Result<Vec<u8>, GatewayError> {
+        Ok(self
+            .download_resource(message_id, image_key, "image")
+            .await?
+            .1)
+    }
+
+    async fn download_resource(
+        &self,
+        message_id: &str,
+        resource_key: &str,
+        resource_type: &str,
+    ) -> Result<(String, Vec<u8>), GatewayError> {
+        if message_id.is_empty() || resource_key.is_empty() {
+            return Err(GatewayError::validation(
+                "Feishu media resource identity is missing",
+            ));
+        }
+        let token = self
+            .get_tenant_access_token()
+            .await
+            .map_err(|_| self.feishu_error("Feishu media authentication failed"))?;
         let settings = self.settings_snapshot();
         let url = format!(
-            "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
+            "{}/open-apis/im/v1/messages/{}/resources/{}?type={}",
             settings.base_url.trim_end_matches('/'),
             urlencoding::encode(message_id),
-            urlencoding::encode(file_key)
+            urlencoding::encode(resource_key),
+            resource_type
         );
         let response = self
             .http
@@ -499,7 +528,7 @@ impl FeishuAdapter {
             .bearer_auth(token)
             .send()
             .await
-            .map_err(|_| self.feishu_error("Feishu audio download did not complete"))?;
+            .map_err(|_| self.feishu_error("Feishu media download did not complete"))?;
         let mime = response
             .headers()
             .get("Content-Type")
@@ -507,7 +536,7 @@ impl FeishuAdapter {
             .unwrap_or("audio/opus")
             .to_string();
         if mime.to_ascii_lowercase().contains("application/json") {
-            return Err(self.feishu_error("Feishu returned an error document instead of audio"));
+            return Err(self.feishu_error("Feishu returned an error document instead of media; check message resource access permission"));
         }
         let bytes = read_bounded_response(response).await?;
         Ok((mime, bytes))
@@ -1420,7 +1449,7 @@ mod tests {
                 }
             }))
             .unwrap();
-        assert_eq!(inbound.text, "飞书图片消息");
+        assert!(inbound.text.is_empty());
         assert_eq!(inbound.attachments[0]["resource_key"], "img_1");
     }
 
