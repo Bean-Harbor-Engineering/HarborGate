@@ -50,6 +50,12 @@ async fn resource(
     assert_eq!(key, "image-key");
     state.resource_requests.fetch_add(1, Ordering::SeqCst);
     let builder = Response::builder();
+    if message == "om_first" {
+        return builder
+            .header("content-type", "image/png")
+            .body(Body::from(picture(image::ImageFormat::Png)))
+            .unwrap();
+    }
     match state.response_mode {
         "forbidden" => builder
             .status(403)
@@ -111,12 +117,15 @@ async fn turn(
             Json(json!({"error":"controlled Beacon outage"})),
         );
     }
+    let failed_image = body
+        .pointer("/input/parts/0/metadata/media_error")
+        .is_some();
     (
         StatusCode::OK,
         Json(json!({
-            "turn":{"turn_id":body["turn"]["turn_id"],"trace_id":body["turn"]["trace_id"],"status":"completed"},
+            "turn":{"turn_id":body["turn"]["turn_id"],"trace_id":body["turn"]["trace_id"],"status":if failed_image { "failed" } else { "completed" }},
             "conversation":{"handle":"conv_image"},
-            "reply":{"kind":"conversation","text":"Image received"},"artifacts":[],"delivery_hints":[]
+            "reply":{"kind":"conversation","text":if failed_image { "请重新发送有效的 JPEG 或 PNG" } else { "Image received" }},"artifacts":[],"delivery_hints":[]
         })),
     )
 }
@@ -353,7 +362,7 @@ async fn provider_denial_error_documents_redirects_size_and_timeout_are_rejected
 }
 
 #[tokio::test]
-async fn unsupported_or_corrupt_image_never_reaches_beacon_and_sender_policy_precedes_download() {
+async fn unsupported_or_corrupt_image_reaches_beacon_only_as_failure_after_sender_policy() {
     for bytes in [
         b"GIF89a-not-supported".to_vec(),
         b"\x89PNG\r\n\x1a\ntruncated".to_vec(),
@@ -379,11 +388,16 @@ async fn unsupported_or_corrupt_image_never_reaches_beacon_and_sender_policy_pre
         assert_eq!(state.resource_requests.load(Ordering::SeqCst), 0);
         cfg.feishu.allowed_users.clear();
         let gateway = GatewayService::from_config(&cfg).unwrap();
-        assert!(gateway
+        gateway
             .handle_inbound("feishu", event("om_invalid", "image-key"))
             .await
-            .is_err());
-        assert!(state.turns.lock().unwrap().is_empty());
+            .unwrap();
+        let turns = state.turns.lock().unwrap().clone();
+        assert_eq!(turns.len(), 1);
+        let part = &turns[0]["input"]["parts"][0];
+        assert_eq!(part["type"], "image");
+        assert_eq!(part["metadata"]["media_error"], "image_invalid");
+        assert_eq!(part.as_object().unwrap().len(), 3);
         assert!(state
             .notices
             .lock()
@@ -396,6 +410,72 @@ async fn unsupported_or_corrupt_image_never_reaches_beacon_and_sender_policy_pre
         assert!(FeishuAdapter::new(cfg.feishu)
             .normalize_inbound(event("", "image-key"))
             .is_err());
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn rejected_new_photo_invalidates_the_old_image_via_one_stable_failed_turn() {
+    for mode in [
+        "image",
+        "forbidden",
+        "json",
+        "redirect",
+        "timeout",
+        "oversize",
+        "chunked_oversize",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mock {
+            bytes: b"not-an-image-provider-secret".to_vec(),
+            resource_requests: AtomicUsize::new(0),
+            turns: Mutex::new(vec![]),
+            notices: Mutex::new(vec![]),
+            fail_turns: AtomicUsize::new(0),
+            response_mode: mode,
+        });
+        let (origin, task) = provider(state.clone()).await;
+        let mut cfg = config(temp.path(), &origin);
+        cfg.feishu.timeout_seconds = 1;
+        let gateway = GatewayService::from_config(&cfg).unwrap();
+        gateway
+            .handle_inbound("feishu", event("om_first", "image-key"))
+            .await
+            .unwrap();
+        let second = event("om_replacement", "image-key");
+        let (first, duplicate) = tokio::join!(
+            gateway.handle_inbound("feishu", second.clone()),
+            gateway.handle_inbound("feishu", second.clone())
+        );
+        assert!(first.is_ok() && duplicate.is_ok());
+        let restarted = GatewayService::from_config(&cfg).unwrap();
+        restarted.handle_inbound("feishu", second).await.unwrap();
+        assert_eq!(state.resource_requests.load(Ordering::SeqCst), 2, "{mode}");
+        let turns = state.turns.lock().unwrap();
+        assert_eq!(
+            turns.len(),
+            2,
+            "{mode}: repeated failed photo cannot execute another turn"
+        );
+        assert!(turns[0]["input"]["parts"][0]["download"].is_object());
+        let failed = &turns[1]["input"]["parts"][0];
+        assert_eq!(failed["type"], "image");
+        assert_eq!(failed.as_object().unwrap().len(), 3);
+        assert_eq!(failed["metadata"].as_object().unwrap().len(), 1);
+        let expected = match mode {
+            "image" => "image_invalid",
+            "oversize" | "chunked_oversize" => "image_too_large",
+            _ => "image_download_failed",
+        };
+        assert_eq!(failed["metadata"]["media_error"], expected);
+        assert_ne!(turns[0]["turn"]["turn_id"], turns[1]["turn"]["turn_id"]);
+        let attachment_id = failed["attachment_id"].as_str().unwrap();
+        assert!(!cfg
+            .state_dir
+            .join("media-inbound")
+            .join(format!("{attachment_id}.json"))
+            .exists());
+        assert!(restarted.read_media(attachment_id, "Bearer any").is_err());
         task.abort();
     }
 }

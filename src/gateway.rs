@@ -97,6 +97,37 @@ impl GatewayService {
         self.media_cache.read(id, authorization)
     }
 
+    async fn prepare_inbound_image(&self, id: &str, message_id: &str, key: &str) -> Value {
+        let prepared = async {
+            if let Some(part) = self.media_cache.descriptor(id)
+                .map_err(|_| "image_storage_unavailable")? {
+                return Ok(part);
+            }
+            let bytes = self.feishu_adapter.download_image(message_id, key).await
+                .map_err(|error| match error.code.as_str() {
+                    "VALIDATION_ERROR" if error.message.contains("32 MiB") => "image_too_large",
+                    "VALIDATION_ERROR" => "image_invalid",
+                    _ => "image_download_failed",
+                })?;
+            let cache = self.media_cache.clone();
+            let owned_id = id.to_owned();
+            let message_id = message_id.to_owned();
+            tokio::task::spawn_blocking(move || cache.store_image(&owned_id, &bytes, &message_id))
+                .await.map_err(|_| "image_storage_unavailable")?
+                .map_err(|error| match error.code.as_str() {
+                    "VALIDATION_ERROR" if error.message.contains("32 MiB") => "image_too_large",
+                    "VALIDATION_ERROR" if error.message.contains("decoding limit") => "image_dimensions_exceeded",
+                    "VALIDATION_ERROR" => "image_invalid",
+                    _ => "image_storage_unavailable",
+                })
+        }.await;
+        prepared.unwrap_or_else(|code| {
+            // A new but unreadable photo must still invalidate Beacon's previous
+            // image context. This is a failed attachment, never a usable media cache.
+            json!({"attachment_id":id,"type":"image","metadata":{"media_error":code}})
+        })
+    }
+
     fn record_previous_delivery(
         &self,
         outbound: &OutboundMessage,
@@ -313,36 +344,24 @@ impl GatewayService {
                     ),
                     40,
                 );
-                *attachment = if let Some(descriptor) = self.media_cache.descriptor(&id)? {
+                let key = attachment
+                    .get("resource_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                *attachment = if kind == "image" {
+                    self.prepare_inbound_image(&id, &inbound.message_id, key).await
+                } else if let Some(descriptor) = self.media_cache.descriptor(&id)? {
                     descriptor
                 } else {
-                    let key = attachment
-                        .get("resource_key")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    if kind == "image" {
-                        let bytes = self
-                            .feishu_adapter
-                            .download_image(&inbound.message_id, key)
-                            .await?;
-                        let cache = self.media_cache.clone();
-                        let message_id = inbound.message_id.clone();
-                        tokio::task::spawn_blocking(move || {
-                            cache.store_image(&id, &bytes, &message_id)
-                        })
-                        .await
-                        .map_err(|_| GatewayError::infrastructure("Image validation did not complete"))??
-                    } else {
-                        let (source_mime, bytes) = self
-                            .feishu_adapter
-                            .download_audio(&inbound.message_id, key)
-                            .await?;
-                        let (wav, duration) = self.feishu_adapter.prepare_inbound_audio(&bytes).await?;
-                        let mut descriptor =
-                            self.media_cache.store(&id, &wav, "audio/wav", duration)?;
-                        descriptor["metadata"]["source_mime_type"] = json!(source_mime);
-                        descriptor
-                    }
+                    let (source_mime, bytes) = self
+                        .feishu_adapter
+                        .download_audio(&inbound.message_id, key)
+                        .await?;
+                    let (wav, duration) = self.feishu_adapter.prepare_inbound_audio(&bytes).await?;
+                    let mut descriptor =
+                        self.media_cache.store(&id, &wav, "audio/wav", duration)?;
+                    descriptor["metadata"]["source_mime_type"] = json!(source_mime);
+                    descriptor
                 };
             }
             if let Some(key) = &replay_key {

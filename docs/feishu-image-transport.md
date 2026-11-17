@@ -20,6 +20,16 @@ Provider HTTP failures, JSON error documents, empty content, and downloads
 over 32 MiB are rejected. The stream is size-limited even without Content-Length.
 No platform token or provider error body is forwarded to Beacon.
 
+A rejected new image still creates a v2 turn after sender authorization. The
+attachment contains only its stable `attachment_id`, `type=image`, and
+`metadata.media_error` (`image_invalid`, `image_too_large`,
+`image_dimensions_exceeded`, `image_download_failed`, or
+`image_storage_unavailable`). There is no usable download descriptor or fabricated
+MIME/hash. Beacon clears the previous image context before displaying this error,
+so a follow-up cannot accidentally describe an older photo. Gate persists the
+prepared failure for duplicate/restart replay; retrying the upload requires a new
+user message. A provider failure never creates a successful media-cache entry.
+
 Only decodable JPEG and PNG are accepted. HEIC, WebP, GIF and corrupt files
 must be re-sent as JPEG/PNG. Limits are 64 million pixels, 16384 pixels per edge,
 and 512 MiB of decoder allocation. Gate preserves original downloaded bytes,
@@ -72,5 +82,8 @@ The image tests use local HTTP providers only: JPEG/PNG byte preservation,
 v2 headers and descriptors, concurrent duplicate events, restart, expired
 capabilities, actual media endpoint authorization, sender allowlist, malformed
 formats, resource denial, redirects, declared/chunked oversize and timeout.
+They also cover a valid photo followed by a rejected replacement, ensuring that
+the failure reaches Beacon once, with no download or credentials, across
+concurrent duplicate events and restart.
 Live phone upload, image understanding, follow-up, authorized save and search
 must still be accepted end to end on the demo device by the integration owner.

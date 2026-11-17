@@ -397,3 +397,11 @@ top-level contract fields are introduced.
 - Gate owns transport validation only. Beacon owns image interpretation,
   follow-up turns, save approval and library/search behavior. Original bytes must
   not be confused with any resized inference copy.
+- After sender authorization, a new image that fails download or validation still
+  reaches Beacon as `{attachment_id,type:"image",metadata:{media_error:<code>}}`.
+  This descriptor has no download, MIME, hash or provider error details. Codes are
+  `image_invalid`, `image_too_large`, `image_dimensions_exceeded`,
+  `image_download_failed`, or `image_storage_unavailable`. Beacon must invalidate
+  the previous photo before reporting the failure; it must not answer using the
+  old photo. Gate persists this failed prepared turn for idempotent replay, never
+  as successful cached media. A fresh user upload has a new message/turn identity.
