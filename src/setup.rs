@@ -966,10 +966,7 @@ impl SetupPortalService {
                 )
             })?;
         let bot_payload = decode_feishu_response(bot_response).await?;
-        Ok(bot_payload
-            .get("data")
-            .cloned()
-            .unwrap_or_else(|| json!({})))
+        feishu_bot_info(&bot_payload)
     }
 
     fn resolve_public_origin(&self, request_host: &str) -> String {
@@ -990,6 +987,16 @@ impl SetupPortalService {
         }
         format!("http://127.0.0.1:{}", self.config.port)
     }
+}
+
+fn feishu_bot_info(payload: &Value) -> Result<Value, GatewayError> {
+    // The Feishu bot/v3/info endpoint returns `bot`, unlike most v3 APIs.
+    payload
+        .get("bot")
+        .or_else(|| payload.get("data"))
+        .filter(|bot| bot.is_object() && !string_field(bot, "open_id").is_empty())
+        .cloned()
+        .ok_or_else(|| GatewayError::validation("飞书认证响应缺少机器人身份。"))
 }
 
 async fn decode_feishu_response(response: reqwest::Response) -> Result<Value, GatewayError> {
@@ -1370,6 +1377,15 @@ form { margin: 0; }
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn feishu_setup_reads_official_bot_identity_and_rejects_missing_identity() {
+        let bot = json!({"app_name":"demo bot", "open_id":"ou_demo", "activate_status":2});
+        assert_eq!(feishu_bot_info(&json!({"code":0,"bot":bot})).unwrap(), bot);
+        assert_eq!(feishu_bot_info(&json!({"code":0,"data":bot})).unwrap(), bot);
+        assert!(feishu_bot_info(&json!({"code":0})).is_err());
+        assert!(feishu_bot_info(&json!({"code":0,"bot":{}})).is_err());
+    }
 
     #[test]
     fn setup_store_bootstraps_python_compatible_state() {
