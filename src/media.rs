@@ -22,6 +22,8 @@ struct CachedMedia {
     duration_ms: u64,
     #[serde(default)]
     image_metadata: Option<Value>,
+    #[serde(default)]
+    file_metadata: Option<Value>,
 }
 
 pub struct MediaCache {
@@ -67,13 +69,16 @@ impl MediaCache {
 
     fn to_descriptor(&self, id: &str, entry: &CachedMedia) -> Value {
         json!({
-            "attachment_id": id, "type": if entry.image_metadata.is_some() { "image" } else { "audio" }, "name": entry.name,
+            "attachment_id": id,
+            "type": if entry.file_metadata.is_some() { "file" } else if entry.image_metadata.is_some() { "image" } else { "audio" },
+            "name": entry.name,
             "mime_type": entry.mime_type, "size_bytes": entry.size_bytes,
             "download": {"mode": "proxy", "url": format!("{}/api/media/{id}", self.origin),
                 "method": "GET", "headers": {"Authorization": format!("Bearer {}", entry.token)},
                 "auth": {"type": "bearer"}, "expires_at": entry.expires_at.to_rfc3339(),
                 "max_size_bytes": MAX_MEDIA_BYTES},
-            "metadata": entry.image_metadata.clone().unwrap_or_else(|| json!({"duration_ms": entry.duration_ms}))
+            "metadata": entry.file_metadata.clone().or_else(|| entry.image_metadata.clone())
+                .unwrap_or_else(|| json!({"duration_ms": entry.duration_ms}))
         })
     }
 
@@ -114,6 +119,7 @@ impl MediaCache {
             size_bytes: bytes.len(),
             duration_ms,
             image_metadata: None,
+            file_metadata: None,
         };
         std::fs::write(path, bytes)?;
         std::fs::write(manifest, serde_json::to_vec(&entry)?)?;
@@ -144,6 +150,49 @@ impl MediaCache {
                 "sha256": format!("{:x}", Sha256::digest(bytes)),
                 "width": width, "height": height,
                 "provider": "feishu", "source_message_id": source_message_id
+            })),
+            file_metadata: None,
+        };
+        std::fs::write(path, bytes)?;
+        std::fs::write(manifest, serde_json::to_vec(&entry)?)?;
+        Ok(self.to_descriptor(id, &entry))
+    }
+
+    /// Cache opaque original file bytes; Beacon owns document validation and interpretation.
+    pub fn store_file(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        mime_type: &str,
+        name: &str,
+        source_message_id: &str,
+    ) -> Result<Value, GatewayError> {
+        if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES {
+            return Err(GatewayError::validation("File must contain 1 byte to 32 MiB"));
+        }
+        if let Some(existing) = self.descriptor(id)? {
+            return Ok(existing);
+        }
+        self.cleanup()?;
+        let (manifest, path) = self.paths(id)?;
+        // A provider name is display data, never a filesystem path or trusted MIME declaration.
+        let name: String = name.rsplit(['/', '\\']).next().unwrap_or("")
+            .chars().filter(|c| !c.is_control()).take(255).collect();
+        let name = name.trim();
+        let mime_type = mime_type.trim();
+        let entry = CachedMedia {
+            token: format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()),
+            expires_at: Utc::now() + ChronoDuration::minutes(10),
+            mime_type: if !mime_type.is_empty() && axum::http::HeaderValue::from_str(mime_type).is_ok() {
+                mime_type.to_string()
+            } else { "application/octet-stream".into() },
+            name: if name.is_empty() || name == "." || name == ".." { "document".into() } else { name.into() },
+            size_bytes: bytes.len(),
+            duration_ms: 0,
+            image_metadata: None,
+            file_metadata: Some(json!({
+                "sha256": format!("{:x}", Sha256::digest(bytes)),
+                "provider":"feishu", "source_message_id":source_message_id
             })),
         };
         std::fs::write(path, bytes)?;
@@ -454,6 +503,41 @@ pub async fn convert_to_opus(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_cache_preserves_opaque_bytes_and_treats_names_as_display_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(dir.path().into(), 8787).unwrap();
+        let bytes = b"opaque, not parsed by Gate";
+        let part = cache.store_file("att_file", bytes, "invalid\r\nheader", "../../..", "om_file").unwrap();
+        assert_eq!(part["type"], "file");
+        assert_eq!(part["name"], "document");
+        assert_eq!(part["mime_type"], "application/octet-stream");
+        assert_eq!(part["metadata"]["sha256"], format!("{:x}", Sha256::digest(bytes)));
+        assert_eq!(cache.store_file("att_file", b"replacement", "text/plain", "other.txt", "om_other").unwrap(), part);
+        assert!(cache.store_file("att_empty", b"", "", "empty.pdf", "om_empty").is_err());
+        assert!(cache.store_file("att_large", &vec![0; MAX_MEDIA_BYTES + 1], "", "large.pdf", "om_large").is_err());
+        assert!(cache.store_file("../outside", bytes, "", "document.pdf", "om_file").is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn existing_audio_and_image_cache_entries_remain_compatible_without_file_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(dir.path().into(), 8787).unwrap();
+        let audio = cache.store("att_audio", b"audio", "audio/opus", 100).unwrap();
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        let image = cache.store_image("att_image", encoded.get_ref(), "om_image").unwrap();
+        for (id, expected) in [("att_audio", audio), ("att_image", image)] {
+            let path = dir.path().join(format!("{id}.json"));
+            let mut entry: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            entry.as_object_mut().unwrap().remove("file_metadata");
+            std::fs::write(path, serde_json::to_vec(&entry).unwrap()).unwrap();
+            assert_eq!(cache.descriptor(id).unwrap().unwrap(), expected);
+            assert!(cache.read(id, expected["download"]["headers"]["Authorization"].as_str().unwrap()).is_ok());
+        }
+    }
+
     #[test]
     fn image_validation_rejects_large_dimensions_and_payloads_before_decoding() {
         let mut encoded = Cursor::new(Vec::new());

@@ -128,6 +128,32 @@ impl GatewayService {
         })
     }
 
+    async fn prepare_inbound_file(&self, id: &str, message_id: &str, key: &str, name: &str) -> Value {
+        let prepared = async {
+            if let Some(part) = self.media_cache.descriptor(id)
+                .map_err(|_| "file_storage_unavailable")? {
+                return Ok(part);
+            }
+            let (mime, bytes) = self.feishu_adapter.download_file(message_id, key).await
+                .map_err(|error| match error.code.as_str() {
+                    "VALIDATION_ERROR" if error.message.contains("32 MiB") => "file_too_large",
+                    "VALIDATION_ERROR" if error.message.contains("empty") => "file_empty",
+                    _ => "file_download_failed",
+                })?;
+            let cache = self.media_cache.clone();
+            let owned_id = id.to_owned();
+            let message_id = message_id.to_owned();
+            let name = name.to_owned();
+            tokio::task::spawn_blocking(move || cache.store_file(&owned_id, &bytes, &mime, &name, &message_id))
+                .await.map_err(|_| "file_storage_unavailable")?
+                .map_err(|_| "file_storage_unavailable")
+        }.await;
+        // Even an unreadable new file is a new document turn: Beacon must clear its old context.
+        prepared.unwrap_or_else(|code| json!({
+            "attachment_id":id,"type":"file","metadata":{"media_error":code}
+        }))
+    }
+
     fn record_previous_delivery(
         &self,
         outbound: &OutboundMessage,
@@ -333,7 +359,7 @@ impl GatewayService {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                if kind != "audio" && kind != "image" {
+                if kind != "audio" && kind != "image" && kind != "file" {
                     continue;
                 }
                 let id = stable_id(
@@ -350,6 +376,9 @@ impl GatewayService {
                     .unwrap_or("");
                 *attachment = if kind == "image" {
                     self.prepare_inbound_image(&id, &inbound.message_id, key).await
+                } else if kind == "file" {
+                    let name = attachment.get("name").and_then(Value::as_str).unwrap_or("document");
+                    self.prepare_inbound_file(&id, &inbound.message_id, key, name).await
                 } else if let Some(descriptor) = self.media_cache.descriptor(&id)? {
                     descriptor
                 } else {

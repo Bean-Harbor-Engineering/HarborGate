@@ -42,7 +42,7 @@ jobs:
           key: photo-demo-HarborGate-ubuntu24-rust194-${{ hashFiles('Cargo.lock') }}
       - name: Run focused photo and voice tests
         run: |
-          cargo test --locked --release --lib --test feishu_image_transport --test feishu_voice_transport --test rust_only_guard
+          cargo test --locked --release --lib --test feishu_image_transport --test feishu_file_transport --test feishu_voice_transport --test rust_only_guard
       - name: Build Linux binary with default features
         run: cargo build --locked --release --bin harboros-im-gate --target x86_64-unknown-linux-gnu
       - name: Record artifact identity

@@ -348,6 +348,19 @@ impl FeishuAdapter {
                     ],
                 )
             }
+            "file" => {
+                let file_key = content.get("file_key").and_then(Value::as_str).unwrap_or("").trim();
+                if file_key.is_empty() || message_id.is_empty() {
+                    return Err(GatewayError::validation(
+                        "Feishu file message is missing file_key or message_id",
+                    ));
+                }
+                (String::new(), vec![json!({
+                    "kind":"file", "provider":"feishu", "resource_key":file_key,
+                    "message_id":message_id,
+                    "name":content.get("file_name").and_then(Value::as_str).unwrap_or("document")
+                })])
+            }
             other => {
                 return Err(GatewayError::validation(format!(
                     "Unsupported Feishu message_type for Rust lane: {}",
@@ -485,7 +498,15 @@ impl FeishuAdapter {
         message_id: &str,
         file_key: &str,
     ) -> Result<(String, Vec<u8>), GatewayError> {
-        self.download_resource(message_id, file_key, "file").await
+        self.download_resource(message_id, file_key, "file", "audio/opus").await
+    }
+
+    pub async fn download_file(
+        &self,
+        message_id: &str,
+        file_key: &str,
+    ) -> Result<(String, Vec<u8>), GatewayError> {
+        self.download_resource(message_id, file_key, "file", "application/octet-stream").await
     }
 
     pub async fn download_image(
@@ -494,7 +515,7 @@ impl FeishuAdapter {
         image_key: &str,
     ) -> Result<Vec<u8>, GatewayError> {
         Ok(self
-            .download_resource(message_id, image_key, "image")
+            .download_resource(message_id, image_key, "image", "audio/opus")
             .await?
             .1)
     }
@@ -504,6 +525,7 @@ impl FeishuAdapter {
         message_id: &str,
         resource_key: &str,
         resource_type: &str,
+        fallback_mime: &str,
     ) -> Result<(String, Vec<u8>), GatewayError> {
         if message_id.is_empty() || resource_key.is_empty() {
             return Err(GatewayError::validation(
@@ -533,7 +555,7 @@ impl FeishuAdapter {
             .headers()
             .get("Content-Type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("audio/opus")
+            .unwrap_or(fallback_mime)
             .to_string();
         if mime.to_ascii_lowercase().contains("application/json") {
             return Err(self.feishu_error("Feishu returned an error document instead of media; check message resource access permission"));
