@@ -4,6 +4,9 @@ set -e
 if [ "${1:-}" = "remove" ] && command -v systemctl >/dev/null 2>&1 \
   && [ -d /run/systemd/system ]; then
   systemctl stop harboros-im-gate.service || true
+  if [ -x /usr/bin/middlewared ]; then
+    systemctl stop harbor-gate-webui-edge.service || true
+  fi
 fi
 
 exit 0

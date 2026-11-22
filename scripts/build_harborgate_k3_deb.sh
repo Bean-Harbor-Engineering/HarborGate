@@ -95,11 +95,21 @@ install -m 0644 debian/harboros-service-auth-recovery.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-service-auth-recovery.service"
 install -m 0644 debian/harbornavi-k3/harboros-im-gate.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-im-gate.service"
+if [[ "$deb_arch" == amd64 ]]; then
+  install -m 0644 debian/harbor-gate-webui-edge.service \
+    "$pkg_dir/usr/lib/systemd/system/harbor-gate-webui-edge.service"
+  install -m 0644 scripts/harboros-edge/edge_proxy.py scripts/harboros-edge/edge_bootstrap.py \
+    "$pkg_dir/usr/lib/harboros-im-gate/"
+fi
 install -m 0644 LICENSE "$pkg_dir/usr/share/doc/harboros-im-gate/copyright"
 sed \
   -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
   debian/harbornavi-k3/control > "$pkg_dir/DEBIAN/control"
+if [[ "$deb_arch" == amd64 ]]; then
+  sed -i '/^Depends:/ s/$/, python3 (>= 3.11), python3-aiohttp (>= 3.9)/' \
+    "$pkg_dir/DEBIAN/control"
+fi
 sed 's/\r$//' debian/harbornavi-k3/postinst > "$pkg_dir/DEBIAN/postinst"
 sed 's/\r$//' debian/harbornavi-k3/prerm > "$pkg_dir/DEBIAN/prerm"
 chmod 0755 "$pkg_dir/DEBIAN/postinst" "$pkg_dir/DEBIAN/prerm"

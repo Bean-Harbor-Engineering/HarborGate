@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+if [ -x /usr/bin/middlewared ]; then
+  systemctl stop harbor-gate-webui-edge.service || true
+  systemctl disable harbor-gate-webui-edge.service || true
+fi
+
 systemctl stop harboros-im-gate.service || true
 systemctl disable harboros-im-gate.service || true
 

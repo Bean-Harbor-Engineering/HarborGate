@@ -191,8 +191,14 @@ impl HarborBeaconTaskClient {
             .get("continuation")
             .filter(|value| value.is_object())
             .cloned();
-        let request_payload =
+        let mut request_payload =
             build_turn_request(incoming, conversation_handle.as_deref(), continuation);
+        if let Some(previous) = session_metadata
+            .get("previous_delivery")
+            .filter(|v| v.is_object())
+        {
+            request_payload["transport"]["metadata"]["previous_delivery"] = previous.clone();
+        }
         let response_payload = self.post_json(&request_payload).await?;
         Ok(map_turn_response(&request_payload, response_payload))
     }
@@ -770,6 +776,8 @@ fn trusted_attachment_mime(raw: &str) -> bool {
 
 fn media_http_client() -> Client {
     Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(200))
         .redirect(Policy::none())
         .build()
         .expect("reqwest client with disabled redirects must build")
@@ -908,7 +916,9 @@ pub fn build_turn_request(
                 "text": true,
                 "image": true,
                 "file": true,
-                "video": true,
+                "video": incoming.platform != "feishu",
+                "audio": incoming.platform == "feishu",
+                "interactive_card": incoming.platform == "feishu",
             },
             "metadata": metadata,
         },

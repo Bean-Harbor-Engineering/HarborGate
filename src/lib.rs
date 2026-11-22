@@ -8,6 +8,7 @@ pub mod harborbeacon;
 pub mod harboros_auth;
 pub mod models;
 mod navi_fleet;
+pub mod media;
 pub mod runtime;
 pub mod server;
 pub mod setup;
