@@ -86,7 +86,7 @@ require_archive_entry() {
 require_field Package "harboros-im-gate"
 require_field Version "$version"
 require_field Architecture "amd64"
-require_field Depends "libc6, util-linux"
+require_field Depends "libc6, util-linux, python3 (>= 3.11), python3-aiohttp (>= 3.9)"
 require_field Provides "harboros-service-auth-abi (= 1)"
 
 data_listing="$work_dir/data.list"

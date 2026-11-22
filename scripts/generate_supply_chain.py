@@ -62,7 +62,7 @@ def validate_first_party_rights(path: Path, source_commit: str) -> dict[str, obj
             "decision": "approved-for-distribution",
             "organization": "Harbor Innovations",
             "scope": ["first-party-brand-materials", "first-party-source-code"],
-            "use": "HarborNavi qualification",
+            "use": ["HarborNavi qualification", "HarborOS Nexus amd64 distribution"],
         }
         or value.get("third_party")
         != {

@@ -45,7 +45,7 @@ impl PlatformAdapter for PeerFixtureAdapter {
                 "fixture transient send failure",
             ));
         }
-        Ok(json!({"provider_message_id":"peer-provider-result"}))
+        Ok(json!({"sent":true,"provider_message_id":"peer-provider-result"}))
     }
     fn profile(&self) -> Value {
         json!({"adapter_name":self.platform})
@@ -164,7 +164,11 @@ async fn peer_reminder_notification_preserves_permit_and_rechecks_before_prepare
                 .unwrap();
             match change {
                 "send" => {
-                    assert_eq!(first["ok"], true);
+                    assert_eq!(
+                        first["ok"],
+                        true,
+                        "platform={platform} change={change} response={first}",
+                    );
                     assert_eq!(sends.load(Ordering::SeqCst), 1);
                     assert!(calls.load(Ordering::SeqCst) >= 2);
                 }

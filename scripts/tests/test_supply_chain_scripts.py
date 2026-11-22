@@ -164,7 +164,7 @@ def rights_payload(commit: str = COMMIT) -> dict:
             "decision": "approved-for-distribution",
             "organization": "Harbor Innovations",
             "scope": ["first-party-brand-materials", "first-party-source-code"],
-            "use": "HarborNavi qualification",
+            "use": ["HarborNavi qualification", "HarborOS Nexus amd64 distribution"],
         },
         "package": PACKAGE,
         "schema_version": 1,

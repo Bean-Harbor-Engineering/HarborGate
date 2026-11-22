@@ -8,7 +8,10 @@
       "first-party-brand-materials",
       "first-party-source-code"
     ],
-    "use": "HarborNavi qualification"
+    "use": [
+      "HarborNavi qualification",
+      "HarborOS Nexus amd64 distribution"
+    ]
   },
   "package": "harboros-im-gate",
   "schema_version": 1,

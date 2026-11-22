@@ -23,6 +23,9 @@ def test_nexus_unit_and_dependency_lane_do_not_inherit_n2_bootstrap():
     assert "harboros-ffmpeg (>= 1.0.0)" in control
     contract=json.loads((ROOT/"debian/nexus/component-contract.json.in").read_text())
     assert contract["product_profile"]=="nexus-amd64"
+    assert contract["candidate_status"]=="qualified_component"
+    assert contract["release_eligible"] is True
+    assert contract["blocking_reasons"]==[]
     assert contract["contracts"][0]["id"]=="harboros.nexus.gate-v2-transport"
     assert not any("riscv64" in c for c in contract["contracts"][0]["capabilities"])
 
