@@ -45,7 +45,7 @@ impl PlatformAdapter for PeerFixtureAdapter {
                 "fixture transient send failure",
             ));
         }
-        Ok(json!({"provider_message_id":"peer-provider-result"}))
+        Ok(json!({"sent":true,"provider_message_id":"peer-provider-result"}))
     }
     fn profile(&self) -> Value {
         json!({"adapter_name":self.platform})
