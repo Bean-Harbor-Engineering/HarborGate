@@ -479,6 +479,14 @@ impl GatewayService {
         outbound: &OutboundMessage,
         response: &Value,
     ) -> Result<(), GatewayError> {
+        if outbound
+            .metadata
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            return Ok(());
+        }
         if self.record_card_receipt(outbound, response)? {
             return Ok(());
         }
@@ -1524,16 +1532,24 @@ impl GatewayService {
                     .unwrap_or("")
                     .trim()
                     .to_string();
+                let partial = adapter_name == "feishu"
+                    && adapter_response.get("partial").and_then(Value::as_bool) == Some(true);
+                let complete = adapter_name != "feishu"
+                    || (adapter_response.get("sent").and_then(Value::as_bool) == Some(true)
+                        && !partial);
                 json!({
                     "delivery_id": delivery_id,
                     "notification_id": notification_id,
                     "trace_id": trace_id,
-                    "ok": true,
-                    "status": adapter_response.get("placeholder_status").and_then(Value::as_str).unwrap_or("sent"),
+                    "ok": complete,
+                    "sent": complete,
+                    "partial": partial,
+                    "status": if partial { "partial" } else if !complete { "not_sent" } else { adapter_response.get("placeholder_status").and_then(Value::as_str).unwrap_or("sent") },
                     "platform": route.get("platform").and_then(Value::as_str).unwrap_or(&adapter_name),
                     "provider_message_id": if provider_message_id.is_empty() { Value::Null } else { json!(provider_message_id) },
-                    "retryable": false,
-                    "error": null,
+                    "delivery_receipts": adapter_response.get("delivery_receipts").cloned().unwrap_or_else(||json!([])),
+                    "retryable": !complete,
+                    "error": if complete { Value::Null } else { adapter_response.get("error").cloned().unwrap_or_else(||json!({"code":"DELIVERY_NOT_SENT","message":"Platform did not confirm complete message delivery"})) },
                 })
             }
             Err(error) if error.code == "IDEMPOTENCY_CONFLICT" => {
