@@ -1745,3 +1745,196 @@ async fn legacy_task_token_cannot_replace_missing_web_api_token() {
     assert!(captured.lock().await.is_empty());
     assert!(authenticator.tokens().await.is_empty());
 }
+
+#[tokio::test]
+async fn nexus_model_selection_and_file_preview_require_verified_admin_on_every_alias() {
+    for prefix in [
+        "/api/beacon",
+        "/api/harbor-assistant",
+        "/api/harbor-gate/api/beacon",
+    ] {
+        for (method, tail) in [
+            (
+                Method::POST,
+                "/models/capabilities/retrieval_answer/selection",
+            ),
+            (Method::GET, "/models/endpoints"),
+            (
+                Method::GET,
+                "/knowledge/preview?path=photo.jpg&workspace_id=attacker",
+            ),
+        ] {
+            let (origin, captured) = mock_beacon().await;
+            let authenticator = Arc::new(FakeAuthenticator::successful());
+            let (mut state, _temp) = test_state(&origin, "service-secret", authenticator.clone());
+            state.config.runtime_profile = "nexus".into();
+            state.config.harbor_workspace_id = "nexus-home".into();
+            let app = router(state);
+            let unauthenticated = Request::builder()
+                .method(method.clone())
+                .uri(format!("{prefix}{tail}"))
+                .header("authorization", "Bearer service-secret")
+                .header("x-harbor-principal-id", "forged-admin")
+                .header("x-harbor-principal-roles", "FULL_ADMIN")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(unauthenticated).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert!(captured.lock().await.is_empty());
+            let verified = Request::builder()
+                .method(method)
+                .uri(format!("{prefix}{tail}"))
+                .header("x-harboros-auth-token", "verified-once")
+                .header("x-harbor-principal-id", "forged-admin")
+                .header("x-harbor-workspace-id", "attacker")
+                .body(Body::empty())
+                .unwrap();
+            assert!(app.oneshot(verified).await.unwrap().status().is_success());
+            let requests = captured.lock().await;
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].headers["x-harbor-principal-id"],
+                "harboros:uid:42"
+            );
+            assert_eq!(requests[0].headers["x-harbor-workspace-id"], "nexus-home");
+            assert!(!requests[0].headers.contains_key("x-harboros-auth-token"));
+            assert!(!requests[0].path_and_query.contains("workspace_id"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn nexus_denies_expired_tokens_and_read_only_model_selection_before_forwarding() {
+    for (result, status) in [
+        (
+            Err(HarborOsAuthFailure::InvalidToken),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            Ok(HarborOsPrincipal {
+                source: "harboros".into(),
+                principal_id: "harboros:uid:9".into(),
+                roles: vec!["SYSTEM_READ".into()],
+                camera_scope: None,
+            }),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let (origin, captured) = mock_beacon().await;
+        let (mut state, _temp) = test_state(
+            &origin,
+            "service-secret",
+            Arc::new(FakeAuthenticator::new(result)),
+        );
+        state.config.runtime_profile = "nexus".into();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/beacon/models/capabilities/retrieval_answer/selection")
+            .header("x-harboros-auth-token", "expired-or-read-only")
+            .body(Body::from(r#"{"model_id":"new-model"}"#))
+            .unwrap();
+        assert_eq!(
+            router(state).oneshot(request).await.unwrap().status(),
+            status
+        );
+        assert!(captured.lock().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn nexus_connection_setup_mutations_and_status_require_verified_admin() {
+    for (method, path) in [
+        (Method::GET, "/api/harbor-gate/api/setup/status"),
+        (Method::POST, "/api/harbor-gate/api/setup/feishu/configure"),
+        (
+            Method::POST,
+            "/api/harbor-gate/api/setup/weixin/login/start",
+        ),
+        (
+            Method::GET,
+            "/api/harbor-gate/api/setup/weixin/login/status",
+        ),
+        (Method::POST, "/api/harbor-gate/api/setup/weixin/unbind"),
+        (Method::GET, "/api/harbor-gate/setup/weixin/qr.svg"),
+    ] {
+        let (mut state, _temp) = test_state(
+            "http://127.0.0.1:1",
+            "service-secret",
+            Arc::new(FakeAuthenticator::successful()),
+        );
+        state.config.runtime_profile = "nexus".into();
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            router(state).oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nexus_feishu_setup_preserves_session_validation_after_admin_authentication() {
+    let (mut state, _temp) = test_state(
+        "http://127.0.0.1:1",
+        "service-secret",
+        Arc::new(FakeAuthenticator::successful()),
+    );
+    state.config.runtime_profile = "nexus".into();
+    // SetupPortalService uses its construction-time product profile too.
+    state.setup = Arc::new(SetupPortalService::new(
+        state.config.clone(),
+        state.gateway.clone(),
+    ));
+    let app = router(state);
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/harbor-gate/api/setup/status")
+                .header("x-harboros-auth-token", "admin-once")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let status: serde_json::Value = serde_json::from_str(&response_body(status).await).unwrap();
+    assert!(status["session_code"].is_string());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/harbor-gate/api/setup/feishu/configure")
+                .header("x-harboros-auth-token", "another-admin-once")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"session_code":status["session_code"],"app_id":"","app_secret":""})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/harbor-gate/setup/feishu")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let page = response_body(response).await;
+    assert!(page.contains("/ui/harbor-assistant?tab=messages"));
+    assert!(!page.contains("session_code"));
+    assert!(!page.contains("app_secret"));
+}

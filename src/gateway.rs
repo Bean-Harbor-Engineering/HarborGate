@@ -11,6 +11,7 @@ use crate::harborbeacon::{
     build_channel_turn_request, derive_route_key, derive_session_id, stable_id,
     HarborBeaconTaskClient,
 };
+use crate::media::MediaCache;
 use crate::models::{ConversationTurn, InboundMessage, OutboundMessage};
 use crate::navi_fleet::NaviFleet;
 use crate::store::{
@@ -26,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
@@ -225,6 +226,8 @@ pub struct GatewayService {
     attachment_cache_root: Arc<AttachmentCacheRoot>,
     public_origin: String,
     delivery_instance_id: String,
+    media_cache: Arc<MediaCache>,
+    chat_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 struct AttachmentCacheGuard {
@@ -304,7 +307,23 @@ impl GatewayService {
         let mut adapters: BTreeMap<String, Arc<dyn PlatformAdapter>> = BTreeMap::new();
         let webhook = Arc::new(WebhookAdapter);
         adapters.insert(webhook.name().to_string(), webhook);
-        let feishu = Arc::new(FeishuAdapter::new(config.feishu.clone()));
+        let ffmpeg = std::env::var("HARBORGATE_FFMPEG_BIN")
+            .or_else(|_| std::env::var("HARBOR_FFMPEG_BIN"))
+            .unwrap_or_else(|_| "ffmpeg".into());
+        let beacon_media_origin =
+            std::env::var("HARBOR_BEACON_MEDIA_ORIGIN").unwrap_or_else(|_| {
+                if config.harborbeacon_base_url.is_empty() {
+                    "http://127.0.0.1:4174".into()
+                } else {
+                    config.harborbeacon_base_url.clone()
+                }
+            });
+        let feishu = Arc::new(FeishuAdapter::with_media(
+            config.feishu.clone(),
+            config.state_dir.join("media-outbound"),
+            PathBuf::from(ffmpeg),
+            beacon_media_origin,
+        ));
         adapters.insert(feishu.name().to_string(), feishu.clone());
         let feishu_mail = Arc::new(FeishuMailAdapter::new(config.feishu_mail.clone()));
         adapters.insert(feishu_mail.name().to_string(), feishu_mail.clone());
@@ -335,6 +354,11 @@ impl GatewayService {
             attachment_cache_root,
             public_origin: config.public_origin.trim_end_matches('/').to_string(),
             delivery_instance_id: Uuid::new_v4().simple().to_string(),
+            media_cache: Arc::new(MediaCache::new(
+                config.state_dir.join("media-inbound"),
+                config.port,
+            )?),
+            chat_locks: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -355,6 +379,337 @@ impl GatewayService {
     }
     pub fn whatsapp_adapter(&self) -> Arc<WhatsAppAdapter> {
         self.whatsapp_adapter.clone()
+    }
+
+    pub fn read_media(
+        &self,
+        id: &str,
+        authorization: &str,
+    ) -> Result<(String, Vec<u8>), GatewayError> {
+        self.media_cache.read(id, authorization)
+    }
+
+    async fn prepare_inbound_image(&self, id: &str, message_id: &str, key: &str) -> Value {
+        let prepared = async {
+            if let Some(part) = self
+                .media_cache
+                .descriptor(id)
+                .map_err(|_| "image_storage_unavailable")?
+            {
+                return Ok(part);
+            }
+            let bytes = self
+                .feishu_adapter
+                .download_image(message_id, key)
+                .await
+                .map_err(|error| match error.code.as_str() {
+                    "VALIDATION_ERROR" if error.message.contains("32 MiB") => "image_too_large",
+                    "VALIDATION_ERROR" => "image_invalid",
+                    _ => "image_download_failed",
+                })?;
+            let cache = self.media_cache.clone();
+            let owned_id = id.to_owned();
+            let message_id = message_id.to_owned();
+            tokio::task::spawn_blocking(move || cache.store_image(&owned_id, &bytes, &message_id))
+                .await
+                .map_err(|_| "image_storage_unavailable")?
+                .map_err(|error| match error.code.as_str() {
+                    "VALIDATION_ERROR" if error.message.contains("32 MiB") => "image_too_large",
+                    "VALIDATION_ERROR" if error.message.contains("decoding limit") => {
+                        "image_dimensions_exceeded"
+                    }
+                    "VALIDATION_ERROR" => "image_invalid",
+                    _ => "image_storage_unavailable",
+                })
+        }
+        .await;
+        prepared.unwrap_or_else(|code| {
+            // A new but unreadable photo must still invalidate Beacon's previous
+            // image context. This is a failed attachment, never a usable media cache.
+            json!({"attachment_id":id,"type":"image","metadata":{"media_error":code}})
+        })
+    }
+
+    async fn prepare_inbound_file(
+        &self,
+        id: &str,
+        message_id: &str,
+        key: &str,
+        name: &str,
+    ) -> Value {
+        let prepared = async {
+            if let Some(part) = self
+                .media_cache
+                .descriptor(id)
+                .map_err(|_| "file_storage_unavailable")?
+            {
+                return Ok(part);
+            }
+            let (mime, bytes) = self
+                .feishu_adapter
+                .download_file(message_id, key)
+                .await
+                .map_err(|error| match error.code.as_str() {
+                    "VALIDATION_ERROR" if error.message.contains("32 MiB") => "file_too_large",
+                    "VALIDATION_ERROR" if error.message.contains("empty") => "file_empty",
+                    _ => "file_download_failed",
+                })?;
+            let cache = self.media_cache.clone();
+            let owned_id = id.to_owned();
+            let message_id = message_id.to_owned();
+            let name = name.to_owned();
+            tokio::task::spawn_blocking(move || {
+                cache.store_file(&owned_id, &bytes, &mime, &name, &message_id)
+            })
+            .await
+            .map_err(|_| "file_storage_unavailable")?
+            .map_err(|_| "file_storage_unavailable")
+        }
+        .await;
+        // Even an unreadable new file is a new document turn: Beacon must clear its old context.
+        prepared.unwrap_or_else(|code| {
+            json!({
+                "attachment_id":id,"type":"file","metadata":{"media_error":code}
+            })
+        })
+    }
+
+    fn record_previous_delivery(
+        &self,
+        outbound: &OutboundMessage,
+        response: &Value,
+    ) -> Result<(), GatewayError> {
+        if self.record_card_receipt(outbound, response)? {
+            return Ok(());
+        }
+        if outbound
+            .metadata
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            return Ok(());
+        }
+        if let Some(receipts) = response.get("delivery_receipts").filter(|v| v.is_array()) {
+            let mut metadata = self
+                .store
+                .load_metadata(&outbound.platform, &outbound.chat_id)?;
+            let mut combined = metadata
+                .get("previous_delivery")
+                .filter(|old| old.get("turn_id") == outbound.metadata.get("turn_id"))
+                .and_then(|old| old.get("receipts"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for receipt in receipts.as_array().into_iter().flatten() {
+                if combined.iter().any(|old| {
+                    old.get("artifact_id") == receipt.get("artifact_id")
+                        && old.get("kind") == receipt.get("kind")
+                }) {
+                    continue;
+                }
+                let mut receipt = receipt.clone();
+                receipt["order"] = json!(combined.len() + 1);
+                combined.push(receipt);
+            }
+            metadata.insert("previous_delivery".into(), json!({"turn_id":outbound.metadata.get("turn_id"),
+                "status":if response.get("partial").and_then(Value::as_bool) == Some(true) {"partial"} else {"completed"},"receipts":combined}));
+            self.store
+                .set_metadata(&outbound.platform, &outbound.chat_id, metadata)?;
+        }
+        Ok(())
+    }
+
+    fn verify_card_origin(&self, inbound: &mut InboundMessage) -> Result<(), GatewayError> {
+        let part = inbound
+            .attachments
+            .iter()
+            .find(|p| p.get("type").and_then(Value::as_str) == Some("card_action"));
+        let Some(part) = part else {
+            return Ok(());
+        };
+        if part
+            .pointer("/metadata/value/action")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Ok(());
+        }
+        let source = part
+            .pointer("/metadata/source_message_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let metadata = self
+            .store
+            .load_metadata(&inbound.platform, &inbound.chat_id)?;
+        let receipt = metadata
+            .get("interactive_cards")
+            .and_then(|cards| cards.get(source))
+            .ok_or_else(|| {
+                GatewayError::validation("Card is not a delivered card in this conversation")
+            })?;
+        if receipt.get("user_id").and_then(Value::as_str) != Some(inbound.user_id.as_str())
+            || receipt.get("chat_type").and_then(Value::as_str) != Some("p2p")
+        {
+            return Err(GatewayError::validation(
+                "Card action does not match its private-chat operator",
+            ));
+        }
+        inbound.chat_type = "p2p".into();
+        Ok(())
+    }
+
+    fn record_card_receipt(
+        &self,
+        outbound: &OutboundMessage,
+        response: &Value,
+    ) -> Result<bool, GatewayError> {
+        if outbound.metadata.get("feishu_card").is_none() {
+            return Ok(false);
+        }
+        if response.get("sent").and_then(Value::as_bool) != Some(true) {
+            return Ok(true);
+        }
+        let id = response
+            .pointer("/responses/0/data/message_id")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                response
+                    .pointer("/responses/0/provider_message_id")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| response.get("provider_message_id").and_then(Value::as_str))
+            .unwrap_or("");
+        if id.is_empty() {
+            return Ok(true);
+        }
+        let mut metadata = self
+            .store
+            .load_metadata(&outbound.platform, &outbound.chat_id)?;
+        let mut cards = metadata
+            .get("interactive_cards")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        cards.insert(
+            id.into(),
+            json!({"user_id":outbound.metadata.get("card_user_id"),
+            "chat_type":outbound.metadata.get("card_chat_type"),"at":crate::models::utc_now_iso()}),
+        );
+        while cards.len() > 32 {
+            let oldest = cards
+                .iter()
+                .min_by_key(|(_, v)| v.get("at").and_then(Value::as_str).unwrap_or(""))
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            cards.remove(&oldest);
+        }
+        metadata.insert("interactive_cards".into(), Value::Object(cards));
+        self.store
+            .set_metadata(&outbound.platform, &outbound.chat_id, metadata)?;
+        Ok(true)
+    }
+
+    async fn feishu_transport_notice(
+        &self,
+        inbound: &InboundMessage,
+        error: Option<&GatewayError>,
+    ) {
+        let failure = error.is_some();
+        let identity = format!(
+            "{}|{}|{}",
+            inbound.platform, inbound.chat_id, inbound.message_id
+        );
+        let key = stable_id(
+            if failure {
+                "processing_failure_"
+            } else {
+                "processing_ack_"
+            },
+            &identity,
+            40,
+        );
+        let notice_lock = self
+            .chat_locks
+            .lock()
+            .expect("chat locks poisoned")
+            .entry(format!(
+                "processing_notice|{}|{}",
+                inbound.platform, inbound.chat_id
+            ))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _notice_guard = notice_lock.lock().await;
+        if !failure {
+            let inbound_key = stable_id("inbound_", &identity, 40);
+            if self
+                .store
+                .load_inbound_record(&inbound_key)
+                .ok()
+                .flatten()
+                .is_some_and(|record| {
+                    record.get("completed").and_then(Value::as_bool) == Some(true)
+                        || record.get("outbound").is_some()
+                })
+            {
+                return;
+            }
+        }
+        // Reserve a separate transport ledger entry before sending. An uncertain
+        // provider response must not produce another acknowledgement on replay.
+        match self.store.load_delivery_record(&key) {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!("Could not read processing-notice checkpoint");
+                return;
+            }
+        }
+        let classification =
+            json!({"kind":if failure {"processing_failure"} else {"processing_ack"}});
+        if self
+            .store
+            .save_delivery_record(
+                &key,
+                &key,
+                json!({"status":"attempted"}),
+                classification.clone(),
+            )
+            .is_err()
+        {
+            tracing::warn!("Could not reserve processing-notice checkpoint");
+            return;
+        }
+        let notice = OutboundMessage {
+            platform: inbound.platform.clone(), chat_id: inbound.chat_id.clone(),
+            text: if error.is_some_and(|err| err.code == "VALIDATION_ERROR")
+                && inbound.attachments.iter().any(|part| part["kind"] == "image") {
+                "图片无法读取，请重新发送有效的 JPEG 或 PNG；文件不超过 32 MiB，像素不超过 6400 万，单边不超过 16384 像素。"
+            } else if failure { "本次处理暂未完成，请稍后重试。" } else { "收到，正在处理…" }.into(),
+            attachments: Vec::new(), timestamp: crate::models::utc_now_iso(),
+            metadata: serde_json::from_value(json!({"idempotency_key":key,"source":"transport_processing_notice"})).unwrap(),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.feishu_adapter.send_outbound(notice),
+        )
+        .await;
+        let record = match result {
+            Ok(Ok(response)) => {
+                json!({"status":if response.get("sent").and_then(Value::as_bool)==Some(true) {"sent"} else {"not_sent"},
+                "provider_message_id":response.get("provider_message_id")})
+            }
+            Ok(Err(_)) => json!({"status":"failed"}),
+            Err(_) => json!({"status":"timed_out"}),
+        };
+        if record["status"] != "sent" {
+            tracing::warn!(
+                "Feishu processing notice did not complete; business processing continues"
+            );
+        }
+        let _ = self
+            .store
+            .save_delivery_record(&key, &key, record, classification);
     }
 
     pub async fn retry_pending_deliveries(&self) -> Result<usize, GatewayError> {
@@ -415,7 +770,175 @@ impl GatewayService {
         let adapter = self
             .adapter(adapter_name)
             .ok_or_else(|| GatewayError::validation(format!("Unknown adapter: {adapter_name}")))?;
-        let inbound = adapter.normalize_inbound(payload)?;
+        let mut inbound = adapter.normalize_inbound(payload)?;
+        self.verify_card_origin(&mut inbound)?;
+        let acknowledge = adapter_name == "feishu"
+            && self.task_client.is_some()
+            && !inbound.message_id.trim().is_empty()
+            && processing_notice_needed(&inbound);
+        if acknowledge {
+            self.feishu_transport_notice(&inbound, None).await;
+        }
+        let result = self
+            .handle_normalized_inbound(adapter_name, adapter, inbound.clone())
+            .await;
+        if acknowledge && result.is_err() {
+            self.feishu_transport_notice(&inbound, result.as_ref().err())
+                .await;
+        }
+        result
+    }
+
+    async fn handle_normalized_inbound(
+        &self,
+        adapter_name: &str,
+        adapter: Arc<dyn PlatformAdapter>,
+        mut inbound: InboundMessage,
+    ) -> Result<Value, GatewayError> {
+        let chat_key = format!("{}|{}", inbound.platform, inbound.chat_id);
+        let chat_lock = self
+            .chat_locks
+            .lock()
+            .expect("chat locks poisoned")
+            .entry(chat_key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _chat_guard = chat_lock.lock().await;
+        let replay_key = if adapter_name == "feishu" && !inbound.message_id.is_empty() {
+            Some(stable_id(
+                "inbound_",
+                &format!(
+                    "{}|{}|{}",
+                    inbound.platform, inbound.chat_id, inbound.message_id
+                ),
+                40,
+            ))
+        } else {
+            None
+        };
+        let existing = replay_key
+            .as_deref()
+            .map(|key| self.store.load_inbound_record(key))
+            .transpose()?
+            .flatten();
+        if let Some(record) = &existing {
+            if record.get("completed").and_then(Value::as_bool) == Some(true) {
+                return Ok(record
+                    .get("response")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"sent":true,"duplicate":true})));
+            }
+            if let Some(cached_outbound) = record.get("outbound") {
+                let mut outbound: OutboundMessage =
+                    serde_json::from_value(cached_outbound.clone())?;
+                let original = record.get("prepared").cloned();
+                let original_metadata = record
+                    .get("session_metadata")
+                    .and_then(Value::as_object)
+                    .cloned();
+                // Replay the same business turn to renew short-lived speech URLs. Beacon
+                // returns its cached answer/audio; successful platform parts stay checkpointed.
+                if let (Some(client), Some(prepared), Some(metadata)) =
+                    (&self.task_client, &original, &original_metadata)
+                {
+                    let prepared: InboundMessage = serde_json::from_value(prepared.clone())?;
+                    let refreshed = client.submit_turn(&prepared, metadata).await?;
+                    if outbound.metadata.get("turn_id").and_then(Value::as_str)
+                        != Some(refreshed.task_id.as_str())
+                    {
+                        return Err(GatewayError::infrastructure(
+                            "Retry did not preserve the original turn identity",
+                        ));
+                    }
+                    outbound.attachments =
+                        native_source_bound_attachments(adapter_name, &refreshed.response_payload);
+                }
+                if let Some(key) = &replay_key {
+                    self.store.save_inbound_record(key,json!({"completed":false,"prepared":original,"session_metadata":original_metadata,"outbound":outbound}))?;
+                }
+                let delivery_key = outbound
+                    .metadata
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let delivery_fingerprint = outbound
+                    .metadata
+                    .get("delivery_request_fingerprint")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+                    .if_empty_then(|| fingerprint(&json!({"turn_id":delivery_key})));
+                let response = self
+                    .deliver_outbound_items_guarded(
+                        adapter.clone(),
+                        outbound.clone(),
+                        &delivery_key,
+                        &delivery_fingerprint,
+                        None,
+                    )
+                    .await?;
+                self.record_previous_delivery(&outbound, &response)?;
+                if let Some(key) = &replay_key {
+                    self.store.save_inbound_record(key, json!({"completed":response.get("sent").and_then(Value::as_bool) == Some(true) && response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":original,"session_metadata":original_metadata,"outbound":outbound,"response":response}))?;
+                }
+                return Ok(response);
+            }
+            if let Some(prepared) = record.get("prepared") {
+                inbound = serde_json::from_value(prepared.clone())?;
+            }
+        }
+        if adapter_name == "feishu" && existing.as_ref().and_then(|r| r.get("prepared")).is_none() {
+            for attachment in &mut inbound.attachments {
+                let kind = attachment
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if kind != "audio" && kind != "image" && kind != "file" {
+                    continue;
+                }
+                let id = stable_id(
+                    "att_",
+                    &format!(
+                        "{}|{}|{}",
+                        inbound.platform, inbound.chat_id, inbound.message_id
+                    ),
+                    40,
+                );
+                let key = attachment
+                    .get("resource_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                *attachment = if kind == "image" {
+                    self.prepare_inbound_image(&id, &inbound.message_id, key)
+                        .await
+                } else if kind == "file" {
+                    let name = attachment
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("document");
+                    self.prepare_inbound_file(&id, &inbound.message_id, key, name)
+                        .await
+                } else if let Some(descriptor) = self.media_cache.descriptor(&id)? {
+                    descriptor
+                } else {
+                    let (source_mime, bytes) = self
+                        .feishu_adapter
+                        .download_audio(&inbound.message_id, key)
+                        .await?;
+                    let (wav, duration) = self.feishu_adapter.prepare_inbound_audio(&bytes).await?;
+                    let mut descriptor =
+                        self.media_cache.store(&id, &wav, "audio/wav", duration)?;
+                    descriptor["metadata"]["source_mime_type"] = json!(source_mime);
+                    descriptor
+                };
+            }
+            if let Some(key) = &replay_key {
+                self.store
+                    .save_inbound_record(key, json!({"completed":false,"prepared":inbound}))?;
+            }
+        }
         let selection = if inbound.platform == "whatsapp" {
             if let Some(fleet) = &self.fleet {
                 if inbound.text.trim().starts_with("NAVI ") {
@@ -448,10 +971,20 @@ impl GatewayService {
             .store
             .load_history(&inbound.platform, &session_key)
             .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
-        let session_metadata = self
-            .store
-            .load_metadata(&inbound.platform, &session_key)
-            .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
+        let session_metadata = existing
+            .as_ref()
+            .and_then(|r| r.get("session_metadata"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or(
+                self.store
+                    .load_metadata(&inbound.platform, &session_key)
+                    .map_err(|err| GatewayError::infrastructure(err.to_string()))?,
+            );
+        let prepared_inbound = inbound.clone();
+        if let Some(key) = &replay_key {
+            self.store.save_inbound_record(key, json!({"completed":false,"prepared":prepared_inbound,"session_metadata":session_metadata}))?;
+        }
         let resolved_route_key = inbound
             .route_key
             .trim()
@@ -476,12 +1009,25 @@ impl GatewayService {
                 let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
                 let attachment_candidates =
                     native_source_bound_attachments(adapter_name, &task_result.response_payload);
-                let reply_text = render_retrieval_reply(
+                let mut reply_text = render_retrieval_reply(
                     &task_result.text,
                     &task_result.response_payload,
                     !attachment_candidates.is_empty(),
                     &self.public_origin,
                 );
+                let image_count = attachment_candidates
+                    .iter()
+                    .filter(|a| a.get("kind").and_then(Value::as_str) == Some("image"))
+                    .count();
+                if adapter_name == "feishu" && image_count > 0 {
+                    reply_text.push_str(&format!(
+                        "\n图片按发送顺序编号：{}。",
+                        (1..=image_count)
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ));
+                }
                 let mut next_metadata = session_metadata.clone();
                 next_metadata.insert("route_key".into(), json!(task_result.route_key));
                 next_metadata.insert("session_id".into(), json!(resolved_session_id));
@@ -532,6 +1078,13 @@ impl GatewayService {
                     task_result.continuation.unwrap_or(Value::Null),
                 );
                 metadata.insert("next_actions".into(), json!(task_result.next_actions));
+                if adapter_name == "feishu" {
+                    if let Some(card) = native_card(&task_result.response_payload)? {
+                        metadata.insert("feishu_card".into(), card);
+                        metadata.insert("card_user_id".into(), json!(inbound.user_id));
+                        metadata.insert("card_chat_type".into(), json!(inbound.chat_type));
+                    }
+                }
                 metadata.insert(
                     "native_attachment_count".into(),
                     json!(attachment_candidates.len()),
@@ -618,14 +1171,23 @@ impl GatewayService {
             .unwrap_or("")
             .to_string()
             .if_empty_then(|| fingerprint(&json!({"turn_id": delivery_key})));
-        self.deliver_outbound_items_guarded(
-            adapter,
-            outbound,
-            &delivery_key,
-            &delivery_fingerprint,
-            None,
-        )
-        .await
+        if let Some(key) = &replay_key {
+            self.store.save_inbound_record(key, json!({"completed":false,"prepared":prepared_inbound,"session_metadata":session_metadata,"outbound":outbound}))?;
+        }
+        let response = self
+            .deliver_outbound_items_guarded(
+                adapter,
+                outbound.clone(),
+                &delivery_key,
+                &delivery_fingerprint,
+                None,
+            )
+            .await?;
+        self.record_previous_delivery(&outbound, &response)?;
+        if let Some(key) = &replay_key {
+            self.store.save_inbound_record(key, json!({"completed":response.get("sent").and_then(Value::as_bool) == Some(true) && response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":prepared_inbound,"session_metadata":session_metadata,"outbound":outbound,"response":response}))?;
+        }
+        Ok(response)
     }
 
     pub async fn handle_gateway_turn(&self, payload: Value) -> Result<Value, GatewayError> {
@@ -975,16 +1537,24 @@ impl GatewayService {
                     .unwrap_or("")
                     .trim()
                     .to_string();
+                let partial = adapter_name == "feishu"
+                    && adapter_response.get("partial").and_then(Value::as_bool) == Some(true);
+                let complete = adapter_name != "feishu"
+                    || (adapter_response.get("sent").and_then(Value::as_bool) == Some(true)
+                        && !partial);
                 json!({
                     "delivery_id": delivery_id,
                     "notification_id": notification_id,
                     "trace_id": trace_id,
-                    "ok": true,
-                    "status": adapter_response.get("placeholder_status").and_then(Value::as_str).unwrap_or("sent"),
+                    "ok": complete,
+                    "sent": complete,
+                    "partial": partial,
+                    "status": if partial { "partial" } else if !complete { "not_sent" } else { adapter_response.get("placeholder_status").and_then(Value::as_str).unwrap_or("sent") },
                     "platform": route.get("platform").and_then(Value::as_str).unwrap_or(&adapter_name),
                     "provider_message_id": if provider_message_id.is_empty() { Value::Null } else { json!(provider_message_id) },
-                    "retryable": false,
-                    "error": null,
+                    "delivery_receipts": adapter_response.get("delivery_receipts").cloned().unwrap_or_else(||json!([])),
+                    "retryable": !complete,
+                    "error": if complete { Value::Null } else { adapter_response.get("error").cloned().unwrap_or_else(||json!({"code":"DELIVERY_NOT_SENT","message":"Platform did not confirm complete message delivery"})) },
                 })
             }
             Err(error) if error.code == "IDEMPOTENCY_CONFLICT" => {
@@ -1212,6 +1782,7 @@ impl GatewayService {
         } = request;
         let stage_pointer = format!("/item/stages/{stage}");
         let stage_item = claim.pointer(&stage_pointer).unwrap_or(&Value::Null);
+        let receipt_outbound = outbound.clone();
         let mut prepared = stage_item
             .get("provider_media_id")
             .and_then(Value::as_str)
@@ -1292,13 +1863,31 @@ impl GatewayService {
                 .await
         };
 
+        if adapter.name() == "feishu" {
+            if let Ok(response) = &result {
+                if let Err(error) = self.record_previous_delivery(&receipt_outbound, response) {
+                    return (Err(error), prepared);
+                }
+            }
+        }
+        let pending_feishu_delivery = adapter.name() == "feishu"
+            && result
+                .as_ref()
+                .ok()
+                .and_then(|response| response.get("sent"))
+                .and_then(Value::as_bool)
+                == Some(false);
         let stage_completion = match &result {
             Ok(response) => DeliveryStageCompletion {
                 delivery_key,
                 item_key,
                 claim_token,
                 stage,
-                status: "succeeded",
+                status: if pending_feishu_delivery {
+                    "failed"
+                } else {
+                    "succeeded"
+                },
                 provider_media_id: response
                     .get("provider_media_id")
                     .or_else(|| response.get("media_id"))
@@ -1321,8 +1910,8 @@ impl GatewayService {
                     .or_else(|| response.get("message_id"))
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty()),
-                retryable: false,
-                last_error: None,
+                retryable: pending_feishu_delivery,
+                last_error: pending_feishu_delivery.then_some("Feishu delivery was not sent"),
             },
             Err(error) => {
                 let unsupported = should_fallback_to_file(error);
@@ -1416,7 +2005,7 @@ impl GatewayService {
             .persist_delivery_plan(
                 delivery_key,
                 request_fingerprint,
-                planned_outbound,
+                planned_outbound.clone(),
                 planned_items,
             )
             .map_err(|error| {
@@ -1430,6 +2019,11 @@ impl GatewayService {
                     GatewayError::infrastructure(error.to_string())
                 }
             })?;
+        let is_feishu = adapter.name() == "feishu";
+        let original_outbound = serde_json::from_value::<OutboundMessage>(planned_outbound.clone())
+            .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+        let mut receipts = Vec::new();
+        let mut responses = Vec::new();
         let mut last_response = json!({});
         for (item_identity, artifact_id, kind, item_outbound) in delivery_items {
             let item_key = delivery_item_key(delivery_key, &item_identity);
@@ -1477,6 +2071,13 @@ impl GatewayService {
                         "provider_media_id": claim.pointer("/item/provider_media_id").cloned().unwrap_or(Value::Null),
                         "provider_client_id": claim.pointer("/item/provider_client_id").cloned().unwrap_or(Value::Null),
                     });
+                    if is_feishu {
+                        last_response["sent"] = json!(true);
+                        if kind != "text" {
+                            receipts.push(json!({"artifact_id":artifact_id,"kind":kind,"status":"sent","provider_message_id":last_response.get("provider_message_id")}));
+                        }
+                        responses.push(last_response.clone());
+                    }
                     continue;
                 }
                 Some("terminal_failed") => {
@@ -1606,6 +2207,45 @@ impl GatewayService {
             };
             match send_result {
                 Ok(response) => {
+                    if adapter.name() == "feishu"
+                        && response.get("sent").and_then(Value::as_bool) == Some(false)
+                    {
+                        self.store
+                            .finish_delivery_item(DeliveryItemCompletion {
+                                delivery_key,
+                                item_key: &item_key,
+                                claim_token,
+                                status: "failed",
+                                provider_media_id: prepared
+                                    .as_ref()
+                                    .map(|value| value.provider_media_id.as_str()),
+                                provider_client_id: prepared
+                                    .as_ref()
+                                    .and_then(|value| value.provider_client_id.as_deref()),
+                                provider_message_id: None,
+                                retryable: true,
+                                last_error: Some("Feishu delivery was not sent"),
+                                fallback_used,
+                            })
+                            .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+                        if responses.is_empty() {
+                            return Ok(response);
+                        }
+                        receipts.extend(
+                            response
+                                .get("delivery_receipts")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .cloned(),
+                        );
+                        responses.push(response.clone());
+                        return Ok(json!({
+                            "platform":"feishu", "sent":false, "partial":true, "status":"partial",
+                            "delivery_receipts":receipts, "responses":responses,
+                            "error":response.get("error").cloned().unwrap_or(Value::Null),
+                        }));
+                    }
                     let provider_message_id = response
                         .get("provider_message_id")
                         .or_else(|| response.get("message_id"))
@@ -1666,6 +2306,12 @@ impl GatewayService {
                         )
                         .await;
                     }
+                    if is_feishu {
+                        if kind != "text" {
+                            receipts.push(json!({"artifact_id":artifact_id,"kind":kind,"status":"sent","provider_message_id":provider_message_id}));
+                        }
+                        responses.push(response.clone());
+                    }
                     last_response = response;
                 }
                 Err(error) => {
@@ -1699,7 +2345,38 @@ impl GatewayService {
                         )
                         .await;
                     }
+                    if is_feishu && !responses.is_empty() {
+                        return Ok(
+                            json!({"platform":"feishu","sent":false,"partial":true,"status":"partial",
+                            "delivery_receipts":receipts,"responses":responses,"error":{"code":error.code,"message":error.message}}),
+                        );
+                    }
                     return Err(error);
+                }
+            }
+        }
+        if is_feishu {
+            let preview = responses
+                .iter()
+                .any(|response| response.get("sent").and_then(Value::as_bool) != Some(true));
+            if let Some(object) = last_response.as_object_mut() {
+                object.insert("sent".into(), json!(!preview));
+                object.insert("attachments".into(), json!(original_outbound.attachments));
+                object.insert("delivery_receipts".into(), json!(receipts));
+                object.insert("responses".into(), json!(responses));
+                if let Some(metadata) = object.get_mut("metadata").and_then(Value::as_object_mut) {
+                    metadata.insert(
+                        "native_attachment_count".into(),
+                        json!(original_outbound.attachments.len()),
+                    );
+                    metadata.insert(
+                        "native_attachment_kinds".into(),
+                        json!(original_outbound
+                            .attachments
+                            .iter()
+                            .filter_map(|a| a.get("kind").and_then(Value::as_str))
+                            .collect::<Vec<_>>()),
+                    );
                 }
             }
         }
@@ -2029,7 +2706,7 @@ fn split_outbound_items(
 ) -> Result<Vec<(String, String, String, OutboundMessage)>, GatewayError> {
     let mut items = Vec::new();
     let mut artifact_ids = HashSet::new();
-    if !outbound.text.trim().is_empty() {
+    if !outbound.text.trim().is_empty() || outbound.metadata.get("feishu_card").is_some() {
         let mut text_outbound = outbound.clone();
         text_outbound.attachments.clear();
         items.push((
@@ -2059,6 +2736,10 @@ fn split_outbound_items(
             .to_string();
         let mut attachment_outbound = outbound.clone();
         attachment_outbound.text.clear();
+        attachment_outbound.metadata.remove("feishu_card");
+        attachment_outbound.metadata.remove("card_user_id");
+        attachment_outbound.metadata.remove("card_chat_type");
+        attachment_outbound.metadata.remove("structured_payload");
         attachment_outbound.attachments = vec![attachment.clone()];
         items.push((
             attachment_item_identity(&artifact_id),
@@ -2342,6 +3023,96 @@ fn first_string(payload: &Value, pointers: &[&str]) -> Option<String> {
     })
 }
 
+fn native_card(payload: &Value) -> Result<Option<Value>, GatewayError> {
+    let Some(card) = payload
+        .get("delivery_hints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|h| h.get("kind").and_then(Value::as_str) == Some("native_card"))
+        .and_then(|h| h.pointer("/metadata/card"))
+    else {
+        return Ok(None);
+    };
+    if card.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return Err(GatewayError::validation("Unsupported neutral card version"));
+    }
+    let title = card
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("HarborOS");
+    let subtitle = card.get("subtitle").and_then(Value::as_str).unwrap_or("");
+    let mut elements = vec![json!({"tag":"div","text":{"tag":"plain_text","content":subtitle}})];
+    for row in card
+        .get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(20)
+    {
+        if let Some(text) = row.get("text").and_then(Value::as_str) {
+            elements.push(json!({"tag":"div","text":{"tag":"plain_text","content":text.chars().take(1800).collect::<String>()}}));
+        }
+    }
+    let actions = card
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if actions.len() > 20 {
+        return Err(GatewayError::validation("Too many card actions"));
+    }
+    for chunk in actions.chunks(5) {
+        let buttons=chunk.iter().map(|action|json!({"tag":"button","type":"default",
+            "text":{"tag":"plain_text","content":action.get("label").and_then(Value::as_str).unwrap_or("选择")},
+            "value":action.get("value").cloned().unwrap_or(Value::Null)})).collect::<Vec<_>>();
+        elements.push(json!({"tag":"action","actions":buttons}));
+    }
+    Ok(Some(
+        json!({"config":{"wide_screen_mode":true},"header":{"template":"blue",
+        "title":{"tag":"plain_text","content":title}},"elements":elements}),
+    ))
+}
+
+fn processing_notice_needed(inbound: &InboundMessage) -> bool {
+    if !inbound.attachments.is_empty() {
+        return true;
+    }
+    let text = inbound
+        .text
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(character, '，' | ',' | '。' | '.' | '？' | '?' | '！' | '!')
+        })
+        .collect::<String>();
+    !text.is_empty()
+        && !matches!(
+            text.as_str(),
+            "你好"
+                | "您好"
+                | "hello"
+                | "hi"
+                | "hey"
+                | "ping"
+                | "测试"
+                | "測試"
+                | "收到"
+                | "好的"
+                | "ok"
+                | "谢谢"
+                | "謝謝"
+                | "thanks"
+                | "thankyou"
+                | "yes"
+                | "no"
+                | "是"
+                | "否"
+        )
+}
+
 fn fallback_reply(history: &[ConversationTurn], inbound: &InboundMessage) -> String {
     if history.is_empty() {
         format!("收到：{}", inbound.text)
@@ -2359,7 +3130,7 @@ fn native_source_bound_attachments(adapter_name: &str, response_payload: &Value)
         return weixin_native_attachments(artifacts, response_payload);
     }
     let images: Vec<Value> = artifacts
-        .into_iter()
+        .iter()
         .filter(|artifact| {
             let kind = artifact
                 .get("kind")
@@ -2373,18 +3144,45 @@ fn native_source_bound_attachments(adapter_name: &str, response_payload: &Value)
             let location = artifact_media_location(artifact).unwrap_or("");
             kind == "image" && mime_type.starts_with("image/") && !location.trim().is_empty()
         })
+        .cloned()
         .collect();
-    if images.is_empty() {
-        return vec![];
-    }
-    if let Some(limit) = native_image_limit(response_payload) {
-        return images.into_iter().take(limit).collect();
-    }
-    if images.len() == 1 {
+    let mut result = if let Some(limit) = native_image_limit(response_payload) {
+        images.into_iter().take(limit).collect()
+    } else if images.len() == 1 {
         images
     } else {
-        vec![]
+        Vec::new()
+    };
+    if adapter_name == "feishu" {
+        for (kind, hint_kind) in [("file", "native_file"), ("audio", "native_audio")] {
+            result.extend(
+                artifacts
+                    .iter()
+                    .filter(|artifact| {
+                        artifact.get("kind").and_then(Value::as_str) == Some(kind)
+                            && response_payload
+                                .get("delivery_hints")
+                                .and_then(Value::as_array)
+                                .is_some_and(|hints| {
+                                    hints.iter().any(|hint| {
+                                        hint.get("kind").and_then(Value::as_str) == Some(hint_kind)
+                                            && (hint
+                                                .get("artifact_id")
+                                                .and_then(Value::as_str)
+                                                .is_none()
+                                                || hint.get("artifact_id").and_then(Value::as_str)
+                                                    == artifact
+                                                        .get("artifact_id")
+                                                        .and_then(Value::as_str))
+                                    })
+                                })
+                    })
+                    .take(1)
+                    .cloned(),
+            );
+        }
     }
+    result
 }
 
 fn weixin_native_attachments(artifacts: Vec<Value>, response_payload: &Value) -> Vec<Value> {
@@ -3393,6 +4191,94 @@ mod tests {
         fn profile(&self) -> Value {
             json!({"adapter_name": "item_delivery"})
         }
+    }
+
+    #[test]
+    fn neutral_model_cards_preserve_opaque_choice_and_private_operator_receipt() {
+        let payload = json!({"delivery_hints":[{"kind":"native_card","metadata":{"card":{
+            "schema_version":1,"title":"Models","rows":[{"text":"Qwen"}],
+            "actions":[{"label":"Select","value":{"action":"model.select","chooser_id":"opaque","option_id":"choice"}}]}}}]});
+        let card = native_card(&payload).unwrap().unwrap();
+        assert_eq!(
+            card["elements"][2]["actions"][0]["value"]["option_id"],
+            "choice"
+        );
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url.clear();
+        let gateway = GatewayService::from_config(&config).unwrap();
+        let mut inbound:InboundMessage=serde_json::from_value(json!({"platform":"feishu","chat_id":"private-chat","user_id":"operator","text":"card",
+            "attachments":[{"type":"card_action","metadata":{"source_message_id":"sent-card","value":{"action":"model.select"}}}]})).unwrap();
+        assert!(gateway.verify_card_origin(&mut inbound).is_err());
+        let outbound = OutboundMessage {
+            platform: "feishu".into(),
+            chat_id: "private-chat".into(),
+            text: "card".into(),
+            attachments: vec![],
+            timestamp: "now".into(),
+            metadata: serde_json::from_value(
+                json!({"feishu_card":card,"card_user_id":"operator","card_chat_type":"p2p"}),
+            )
+            .unwrap(),
+        };
+        gateway
+            .record_previous_delivery(
+                &outbound,
+                &json!({"sent":true,"provider_message_id":"last-photo",
+                    "responses":[{"provider_message_id":"sent-card"}]}),
+            )
+            .unwrap();
+        gateway.verify_card_origin(&mut inbound).unwrap();
+        inbound.user_id = "other".into();
+        assert!(gateway.verify_card_origin(&mut inbound).is_err());
+    }
+
+    #[test]
+    fn feishu_media_projection_requires_hints_and_keeps_original_kind() {
+        let payload = json!({"artifacts":[
+            {"kind":"image","artifact_id":"photo_1","mime_type":"image/jpeg","path":"/photo.jpg"},
+            {"kind":"file","artifact_id":"original_1","mime_type":"image/jpeg","path":"/photo.jpg"},
+            {"kind":"audio","artifact_id":"speech_1","mime_type":"audio/wav","url":"http://127.0.0.1:4174/api/web/media/speech_1"}],
+            "delivery_hints":[{"kind":"native_image","metadata":{"max_items":3}},
+                {"kind":"native_file","artifact_id":"original_1"},{"kind":"native_audio","artifact_id":"speech_1"}]});
+        let parts = native_source_bound_attachments("feishu", &payload);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|p| p["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["image", "file", "audio"]
+        );
+        let mut no_hint = payload.clone();
+        no_hint["delivery_hints"] = json!([]);
+        assert_eq!(native_source_bound_attachments("feishu", &no_hint).len(), 1);
+        assert!(
+            native_source_bound_attachments("weixin", &payload)
+                .iter()
+                .all(|part| part["kind"] != "audio"),
+            "Weixin voice must not be advertised as supported"
+        );
+    }
+
+    #[test]
+    fn feishu_media_projection_ignores_unhinted_candidates_before_limits() {
+        let payload = json!({"artifacts": [
+            {"kind":"audio", "path":"/retrieved-recording.wav", "mime_type":"audio/wav"},
+            {"kind":"file", "artifact_id":"unselected_source", "path":"/other.md"},
+            {"kind":"audio", "artifact_id":"speech_actual", "mime_type":"audio/wav",
+                "url":"http://127.0.0.1:4174/api/web/media/speech_actual"},
+            {"kind":"file", "artifact_id":"selected_source", "path":"/backup-guide.md"},
+            {"kind":"audio", "artifact_id":"speech_other", "mime_type":"audio/wav"}
+        ], "delivery_hints": [
+            {"kind":"native_audio", "artifact_id":"speech_actual"},
+            {"kind":"native_file", "artifact_id":"selected_source"}
+        ]});
+        let parts = native_source_bound_attachments("feishu", &payload);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["artifact_id"], "selected_source");
+        assert_eq!(parts[1]["artifact_id"], "speech_actual");
     }
 
     #[tokio::test]

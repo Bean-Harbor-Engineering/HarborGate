@@ -3,7 +3,7 @@ Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: libc6, util-linux
+Depends: libc6, util-linux, python3 (>= 3.11), python3-aiohttp (>= 3.9)
 Provides: harboros-service-auth-abi (= 1)
 Maintainer: Harborinno Ltd.
 Description: HarborNAS IM Gateway Service

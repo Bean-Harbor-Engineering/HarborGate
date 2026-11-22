@@ -1,0 +1,18 @@
+[Unit]
+Description=HarborGate authenticated NAS WebUI transport
+ConditionPathExists=/usr/bin/middlewared
+After=network.target middlewared.service harboros-beacon.service
+Wants=middlewared.service harboros-beacon.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /usr/lib/harboros-im-gate/edge_bootstrap.py
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=harbor-gate-webui-edge
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

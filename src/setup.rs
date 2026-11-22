@@ -209,6 +209,13 @@ impl SetupPortalService {
         request_host: &str,
         route_prefix: &str,
     ) -> String {
+        if self.config.runtime_profile == "nexus" {
+            return portal_document(
+                "消息连接",
+                r#"<section class="card stack"><h1>消息连接</h1><p>请在 HarborOS 中管理连接。</p><a href="/ui/harbor-assistant?tab=messages">打开 Harbor Assistant</a></section>"#,
+                true,
+            );
+        }
         let prefix = normalized_route_prefix(route_prefix);
         let status = self.status_payload_with_prefix(request_host, &prefix);
         let feishu = &status["feishu"];
@@ -314,6 +321,13 @@ impl SetupPortalService {
         unbound: bool,
         route_prefix: &str,
     ) -> String {
+        if self.config.runtime_profile == "nexus" {
+            return portal_document(
+                "消息连接",
+                r#"<section class="card stack"><h1>消息连接</h1><p>请在 HarborOS 中管理连接。</p><a href="/ui/harbor-assistant?tab=messages">打开 Harbor Assistant</a></section>"#,
+                true,
+            );
+        }
         let prefix = normalized_route_prefix(route_prefix);
         let status = self.status_payload_with_prefix(request_host, &prefix);
         let weixin = &status["weixin"];
@@ -462,6 +476,13 @@ impl SetupPortalService {
     }
 
     pub fn build_qr_page_with_prefix(&self, route_prefix: &str) -> String {
+        if self.config.runtime_profile == "nexus" {
+            return portal_document(
+                "消息连接",
+                r#"<section class="card stack"><h1>消息连接</h1><p>请在 HarborOS 中管理连接。</p><a href="/ui/harbor-assistant?tab=messages">打开 Harbor Assistant</a></section>"#,
+                true,
+            );
+        }
         let prefix = normalized_route_prefix(route_prefix);
         let qr_svg_url = prefixed_path(&prefix, "/setup/feishu/qr.svg");
         portal_document(
@@ -493,6 +514,9 @@ impl SetupPortalService {
         request_host: &str,
         route_prefix: &str,
     ) -> String {
+        if self.config.runtime_profile == "nexus" {
+            return qr_to_svg("/ui/harbor-assistant?tab=messages");
+        }
         let status = self.status_payload_with_prefix(request_host, route_prefix);
         let target = status
             .pointer("/feishu/setup_url")
@@ -968,10 +992,7 @@ impl SetupPortalService {
                 )
             })?;
         let bot_payload = decode_feishu_response(bot_response).await?;
-        Ok(bot_payload
-            .get("data")
-            .cloned()
-            .unwrap_or_else(|| json!({})))
+        feishu_bot_info(&bot_payload)
     }
 
     fn resolve_public_origin(&self, request_host: &str) -> String {
@@ -992,6 +1013,16 @@ impl SetupPortalService {
         }
         format!("http://127.0.0.1:{}", self.config.port)
     }
+}
+
+fn feishu_bot_info(payload: &Value) -> Result<Value, GatewayError> {
+    // The Feishu bot/v3/info endpoint returns `bot`, unlike most v3 APIs.
+    payload
+        .get("bot")
+        .or_else(|| payload.get("data"))
+        .filter(|bot| bot.is_object() && !string_field(bot, "open_id").is_empty())
+        .cloned()
+        .ok_or_else(|| GatewayError::validation("飞书认证响应缺少机器人身份。"))
 }
 
 async fn decode_feishu_response(response: reqwest::Response) -> Result<Value, GatewayError> {
@@ -1370,6 +1401,15 @@ form { margin: 0; }
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn feishu_setup_reads_official_bot_identity_and_rejects_missing_identity() {
+        let bot = json!({"app_name":"demo bot", "open_id":"ou_demo", "activate_status":2});
+        assert_eq!(feishu_bot_info(&json!({"code":0,"bot":bot})).unwrap(), bot);
+        assert_eq!(feishu_bot_info(&json!({"code":0,"data":bot})).unwrap(), bot);
+        assert!(feishu_bot_info(&json!({"code":0})).is_err());
+        assert!(feishu_bot_info(&json!({"code":0,"bot":{}})).is_err());
+    }
 
     #[test]
     fn setup_store_bootstraps_python_compatible_state() {

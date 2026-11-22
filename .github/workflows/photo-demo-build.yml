@@ -1,0 +1,62 @@
+name: Photo demo Linux artifact
+
+on:
+  push:
+    branches: [codex/feishu-photo-demo-20261120]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: photo-demo-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev clang cmake ffmpeg
+      - name: Select Rust toolchain
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal --target x86_64-unknown-linux-gnu
+          rustup override set 1.96.1
+          rustc --version
+          cargo --version
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: photo-demo-HarborGate-ubuntu24-rust196-${{ hashFiles('Cargo.lock') }}
+      - name: Run focused photo and voice tests
+        run: |
+          cargo test --locked --release --lib --test feishu_image_transport --test feishu_file_transport --test feishu_voice_transport --test rust_only_guard
+      - name: Build Linux binary with default features
+        run: cargo build --locked --release --bin harboros-im-gate --target x86_64-unknown-linux-gnu
+      - name: Record artifact identity
+        run: |
+          mkdir -p artifacts
+          install -m 0755 target/x86_64-unknown-linux-gnu/release/harboros-im-gate artifacts/harboros-im-gate
+          git rev-parse HEAD > artifacts/source-sha.txt
+          rustc --version > artifacts/toolchain.txt
+          ldd artifacts/harboros-im-gate > artifacts/runtime-dependencies.txt
+          (cd artifacts && sha256sum harboros-im-gate source-sha.txt toolchain.txt runtime-dependencies.txt > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harboros-im-gate-linux-amd64-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+

@@ -3,9 +3,18 @@ name: release
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing source tag version without the v prefix (for example 1.0.0)
+      version:
+        description: Immutable product version, for example 1.1.0+nexus.amd64.build123
         required: true
+      source_commit:
+        description: Full 40-character formal source commit
+        required: true
+      product_profile:
+        description: Product and architecture
+        required: true
+        default: nexus-amd64
+        type: choice
+        options: [nexus-amd64, n2-riscv64]
 
 permissions:
   contents: write
@@ -13,7 +22,9 @@ permissions:
 env:
   BUILD_CONTAINER_DIGEST: sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
   DEBIAN_SNAPSHOT: 20260801T000000Z
-  DEBIAN_VERSION: ${{ inputs.tag }}
+  DEBIAN_VERSION: ${{ inputs.version }}
+  SOURCE_COMMIT: ${{ inputs.source_commit }}
+  HARBOR_GATE_PRODUCT_PROFILE: ${{ inputs.product_profile }}
 
 jobs:
   build-audited-deb:
@@ -22,55 +33,125 @@ jobs:
     container:
       image: rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
     steps:
-      - name: Checkout the exact release tag
+      - name: Reserve immutable release version including tagless drafts
+        env:
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        # Inline before checkout so old pinned sources also receive this guard.
+        run: |
+          python3 - <<'PY'
+          # BEGIN GATE_RELEASE_NAMESPACE_GUARD
+          import json
+          import os
+          from urllib.error import HTTPError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+
+          def assert_unpublished(repository, version, token, opener=urlopen):
+              headers = {"Accept": "application/vnd.github+json"}
+              if token:
+                  headers["Authorization"] = "Bearer " + token
+              suffix = quote("v" + version, safe="")
+              for endpoint in ("/releases/tags/", "/git/ref/tags/"):
+                  url = "https://api.github.com/repos/" + repository + endpoint + suffix
+                  try:
+                      with opener(Request(url, headers=headers), timeout=20):
+                          raise ValueError("Release/tag version already exists")
+                  except HTTPError as error:
+                      if error.code != 404:
+                          raise ValueError("Could not verify release/tag reservation") from error
+              # A draft may reserve a version without creating its Git tag.
+              for page in range(1, 101):
+                  url = f"https://api.github.com/repos/{repository}/releases?per_page=100&page={page}"
+                  try:
+                      with opener(Request(url, headers=headers), timeout=20) as response:
+                          releases = json.load(response)
+                  except (HTTPError, ValueError) as error:
+                      raise ValueError("Could not inspect release inventory") from error
+                  if not isinstance(releases, list) or not all(isinstance(item, dict) for item in releases):
+                      raise ValueError("Invalid release inventory")
+                  if any(item.get("tag_name") == "v" + version for item in releases):
+                      raise ValueError("Draft/release version already exists")
+                  if len(releases) < 100:
+                      return
+              raise ValueError("Release inventory exceeds reservation-check limit")
+
+
+          if __name__ == "__main__":
+              assert_unpublished(os.environ["REPOSITORY"], os.environ["VERSION"], os.environ["GH_TOKEN"])
+          # END GATE_RELEASE_NAMESPACE_GUARD
+          PY
+      - name: Checkout the pinned source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
-          ref: refs/tags/v${{ inputs.tag }}
-
-      - name: Trust the checked-out container workspace
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Verify tag and source commit
+          ref: ${{ inputs.source_commit }}
+      - name: Validate immutable source and product version
+        shell: bash
         run: |
-          test "$(git rev-list -n 1 "refs/tags/v${DEBIAN_VERSION}")" = "$(git rev-parse HEAD)"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git merge-base --is-ancestor 9dc3e3c0a3dcdd6d40c9421529ff818bb1084d3f "$SOURCE_COMMIT"
           test -z "$(git status --porcelain --untracked-files=normal)"
+          ! git show-ref --verify --quiet "refs/tags/v$DEBIAN_VERSION"
+          case "$HARBOR_GATE_PRODUCT_PROFILE" in
+            nexus-amd64)
+              [[ "$DEBIAN_VERSION" =~ ^1\.1\.0\+nexus\.amd64\.[0-9A-Za-z][0-9A-Za-z.-]*$ ]]
+              echo DEB_ARCH=amd64 >> "$GITHUB_ENV"
+              echo RUST_TARGET=x86_64-unknown-linux-gnu >> "$GITHUB_ENV"
+              ;;
+            n2-riscv64)
+              [[ "$DEBIAN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+n2\.riscv64\.[0-9A-Za-z][0-9A-Za-z.-]*$ ]]
+              echo DEB_ARCH=riscv64 >> "$GITHUB_ENV"
+              echo RUST_TARGET=riscv64gc-unknown-linux-gnu >> "$GITHUB_ENV"
+              ;;
+            *) exit 2 ;;
+          esac
           dpkg --validate-version "$DEBIAN_VERSION"
-
       - name: Install snapshot-pinned packaging tools
         env:
           HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+        shell: bash
         run: |
           bash scripts/configure_debian_snapshot.sh
           apt-get update
-          apt-get install --yes --no-install-recommends dpkg-dev init-system-helpers iproute2 python3 python3-pytest xz-utils
-          rustup target add x86_64-unknown-linux-gnu
-
-      - name: Build, compare, and exercise the audited package
+          apt-get install --yes --no-install-recommends binutils dpkg-dev init-system-helpers iproute2 python3 python3-pytest xz-utils
+          if [ "$DEB_ARCH" = riscv64 ]; then
+            apt-get install --yes --no-install-recommends gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
+          fi
+          rustup target add "$RUST_TARGET"
+      - name: Test, build and verify the selected product
         env:
-          DEB_ARCH: amd64
-          RUST_TARGET: x86_64-unknown-linux-gnu
           HARBORGATE_BUILD_CONTAINER_DIGEST: ${{ env.BUILD_CONTAINER_DIGEST }}
           HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+        shell: bash
         run: |
-          export SOURCE_COMMIT="$(git rev-parse HEAD)"
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
-          python3 -m pytest scripts/tests/test_supply_chain_scripts.py -q
+          cargo test --locked --all-targets
+          python3 -m pytest scripts/tests/test_supply_chain_scripts.py scripts/tests/test_product_profiles.py scripts/tests/test_release_namespace.py -q
           bash scripts/verify_k3_reproducible.sh
-          bash scripts/build_harborgate_k3_deb.sh
+          bash scripts/build_harborgate_product_deb.sh
           (cd dist/harborgate-debs && sha256sum --check ./*.sha256)
           python3 scripts/verify_release_bundle.py dist/harborgate-debs \
-            --arch amd64 --version "$DEBIAN_VERSION" \
-            --require-release-eligible
-          bash scripts/test_deb_lifecycle.sh dist/harborgate-debs/*.deb
-
-      - name: Create release from the verified tag
+            --arch "$DEB_ARCH" --version "$DEBIAN_VERSION" \
+            --product-profile "$HARBOR_GATE_PRODUCT_PROFILE" --require-release-eligible
+          python3 scripts/verify_product_deb.py dist/harborgate-debs/*.deb \
+            --product-profile "$HARBOR_GATE_PRODUCT_PROFILE" --version "$DEBIAN_VERSION"
+          if [ "$DEB_ARCH" = amd64 ]; then
+            bash scripts/test_nexus_deb_lifecycle.sh dist/harborgate-debs/*.deb
+          fi
+      - name: Create a draft release for review
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          tag_name: v${{ inputs.tag }}
-          name: v${{ inputs.tag }}
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          target_commitish: ${{ inputs.source_commit }}
           generate_release_notes: true
           files: dist/harborgate-debs/*
           fail_on_unmatched_files: true
-          draft: false
+          draft: true
           prerelease: false

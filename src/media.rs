@@ -1,0 +1,706 @@
+//! Short-lived, single-file capabilities for platform media. No platform token crosses the seam.
+use crate::error::GatewayError;
+use axum::http::StatusCode;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use reqwest::{Client, Url};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+pub const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedMedia {
+    token: String,
+    expires_at: DateTime<Utc>,
+    mime_type: String,
+    name: String,
+    size_bytes: usize,
+    duration_ms: u64,
+    #[serde(default)]
+    image_metadata: Option<Value>,
+    #[serde(default)]
+    file_metadata: Option<Value>,
+}
+
+pub struct MediaCache {
+    root: PathBuf,
+    origin: String,
+}
+
+impl MediaCache {
+    pub fn new(root: PathBuf, port: u16) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&root)?;
+        Ok(Self {
+            root,
+            origin: format!("http://127.0.0.1:{port}"),
+        })
+    }
+
+    fn paths(&self, id: &str) -> Result<(PathBuf, PathBuf), GatewayError> {
+        if id.is_empty()
+            || id.len() > 100
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        {
+            return Err(GatewayError::validation(
+                "Invalid media attachment identity",
+            ));
+        }
+        Ok((
+            self.root.join(format!("{id}.json")),
+            self.root.join(format!("{id}.bin")),
+        ))
+    }
+
+    pub fn descriptor(&self, id: &str) -> Result<Option<Value>, GatewayError> {
+        let (manifest, _) = self.paths(id)?;
+        if !manifest.exists() {
+            return Ok(None);
+        }
+        let entry: CachedMedia = serde_json::from_slice(&std::fs::read(manifest)?)?;
+        // Stable on retries: expired capabilities are never silently renewed for the same turn.
+        Ok(Some(self.to_descriptor(id, &entry)))
+    }
+
+    fn to_descriptor(&self, id: &str, entry: &CachedMedia) -> Value {
+        json!({
+            "attachment_id": id,
+            "type": if entry.file_metadata.is_some() { "file" } else if entry.image_metadata.is_some() { "image" } else { "audio" },
+            "name": entry.name,
+            "mime_type": entry.mime_type, "size_bytes": entry.size_bytes,
+            "download": {"mode": "proxy", "url": format!("{}/api/media/{id}", self.origin),
+                "method": "GET", "headers": {"Authorization": format!("Bearer {}", entry.token)},
+                "auth": {"type": "bearer"}, "expires_at": entry.expires_at.to_rfc3339(),
+                "max_size_bytes": MAX_MEDIA_BYTES},
+            "metadata": entry.file_metadata.clone().or_else(|| entry.image_metadata.clone())
+                .unwrap_or_else(|| json!({"duration_ms": entry.duration_ms}))
+        })
+    }
+
+    pub fn store(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        mime_type: &str,
+        duration_ms: u64,
+    ) -> Result<Value, GatewayError> {
+        if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES {
+            return Err(GatewayError::validation(
+                "Audio must contain 1 byte to 32 MiB",
+            ));
+        }
+        if let Some(existing) = self.descriptor(id)? {
+            return Ok(existing);
+        }
+        self.cleanup()?;
+        let (manifest, path) = self.paths(id)?;
+        let entry = CachedMedia {
+            token: format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            expires_at: Utc::now() + ChronoDuration::minutes(10),
+            mime_type: if mime_type.starts_with("audio/") {
+                mime_type.to_string()
+            } else {
+                "audio/opus".into()
+            },
+            name: if mime_type == "audio/wav" {
+                "voice.wav".into()
+            } else {
+                "voice.opus".into()
+            },
+            size_bytes: bytes.len(),
+            duration_ms,
+            image_metadata: None,
+            file_metadata: None,
+        };
+        std::fs::write(path, bytes)?;
+        std::fs::write(manifest, serde_json::to_vec(&entry)?)?;
+        Ok(self.to_descriptor(id, &entry))
+    }
+
+    /// Validate decoded content, but preserve the provider's original JPEG/PNG bytes.
+    pub fn store_image(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        source_message_id: &str,
+    ) -> Result<Value, GatewayError> {
+        if let Some(existing) = self.descriptor(id)? {
+            return Ok(existing);
+        }
+        let (mime, extension, width, height) = validate_image(bytes)?;
+        self.cleanup()?;
+        let (manifest, path) = self.paths(id)?;
+        let entry = CachedMedia {
+            token: format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            expires_at: Utc::now() + ChronoDuration::minutes(10),
+            mime_type: mime.into(),
+            name: format!("image.{extension}"),
+            size_bytes: bytes.len(),
+            duration_ms: 0,
+            image_metadata: Some(json!({
+                "sha256": format!("{:x}", Sha256::digest(bytes)),
+                "width": width, "height": height,
+                "provider": "feishu", "source_message_id": source_message_id
+            })),
+            file_metadata: None,
+        };
+        std::fs::write(path, bytes)?;
+        std::fs::write(manifest, serde_json::to_vec(&entry)?)?;
+        Ok(self.to_descriptor(id, &entry))
+    }
+
+    /// Cache opaque original file bytes; Beacon owns document validation and interpretation.
+    pub fn store_file(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        mime_type: &str,
+        name: &str,
+        source_message_id: &str,
+    ) -> Result<Value, GatewayError> {
+        if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES {
+            return Err(GatewayError::validation(
+                "File must contain 1 byte to 32 MiB",
+            ));
+        }
+        if let Some(existing) = self.descriptor(id)? {
+            return Ok(existing);
+        }
+        self.cleanup()?;
+        let (manifest, path) = self.paths(id)?;
+        // A provider name is display data, never a filesystem path or trusted MIME declaration.
+        let name: String = name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(255)
+            .collect();
+        let name = name.trim();
+        let mime_type = mime_type.trim();
+        let entry = CachedMedia {
+            token: format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            expires_at: Utc::now() + ChronoDuration::minutes(10),
+            mime_type: if !mime_type.is_empty()
+                && axum::http::HeaderValue::from_str(mime_type).is_ok()
+            {
+                mime_type.to_string()
+            } else {
+                "application/octet-stream".into()
+            },
+            name: if name.is_empty() || name == "." || name == ".." {
+                "document".into()
+            } else {
+                name.into()
+            },
+            size_bytes: bytes.len(),
+            duration_ms: 0,
+            image_metadata: None,
+            file_metadata: Some(json!({
+                "sha256": format!("{:x}", Sha256::digest(bytes)),
+                "provider":"feishu", "source_message_id":source_message_id
+            })),
+        };
+        std::fs::write(path, bytes)?;
+        std::fs::write(manifest, serde_json::to_vec(&entry)?)?;
+        Ok(self.to_descriptor(id, &entry))
+    }
+
+    pub fn read(&self, id: &str, authorization: &str) -> Result<(String, Vec<u8>), GatewayError> {
+        let (manifest, path) = self.paths(id)?;
+        let unavailable = || {
+            GatewayError::new(
+                StatusCode::NOT_FOUND,
+                "MEDIA_NOT_AVAILABLE",
+                "Media capability is unavailable or expired",
+            )
+        };
+        let raw = std::fs::read(manifest).map_err(|_| unavailable())?;
+        let entry: CachedMedia = serde_json::from_slice(&raw).map_err(|_| unavailable())?;
+        if entry.expires_at <= Utc::now() || authorization != format!("Bearer {}", entry.token) {
+            return Err(unavailable());
+        }
+        let metadata = std::fs::metadata(&path).map_err(|_| unavailable())?;
+        if metadata.len() as usize > MAX_MEDIA_BYTES {
+            return Err(unavailable());
+        }
+        let bytes = std::fs::read(path).map_err(|_| unavailable())?;
+        Ok((entry.mime_type, bytes))
+    }
+
+    fn cleanup(&self) -> Result<(), GatewayError> {
+        for item in std::fs::read_dir(&self.root)? {
+            let path = item?.path();
+            if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<CachedMedia>(&raw) else {
+                continue;
+            };
+            if entry.expires_at <= Utc::now() {
+                if let Some(id) = path.file_stem().and_then(|v| v.to_str()) {
+                    if let Ok((manifest, binary)) = self.paths(id) {
+                        let _ = std::fs::remove_file(binary);
+                        let _ = std::fs::remove_file(manifest);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_image(bytes: &[u8]) -> Result<(&'static str, &'static str, u32, u32), GatewayError> {
+    if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES {
+        return Err(GatewayError::validation(
+            "Image must contain 1 byte to 32 MiB",
+        ));
+    }
+    let unsupported =
+        || GatewayError::validation("Image could not be decoded; send a valid JPEG or PNG image");
+    let format = image::guess_format(bytes).map_err(|_| unsupported())?;
+    let (mime, extension) = match format {
+        image::ImageFormat::Jpeg => ("image/jpeg", "jpg"),
+        image::ImageFormat::Png => ("image/png", "png"),
+        _ => return Err(unsupported()),
+    };
+    let (width, height) = image::ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|_| unsupported())?;
+    if width == 0
+        || height == 0
+        || width > 16384
+        || height > 16384
+        || u64::from(width) * u64::from(height) > 64_000_000
+    {
+        return Err(GatewayError::validation(
+            "Image exceeds the 64 megapixel or 16384 pixel edge decoding limit",
+        ));
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().map_err(|_| unsupported())?;
+    Ok((mime, extension, width, height))
+}
+
+pub fn media_client(seconds: u64) -> Client {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(seconds))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("valid media HTTP client")
+}
+
+pub async fn read_bounded_response(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, GatewayError> {
+    if !response.status().is_success() {
+        return Err(GatewayError::infrastructure(format!(
+            "Media download failed with HTTP {}",
+            response.status()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_MEDIA_BYTES as u64)
+    {
+        return Err(GatewayError::validation("Media exceeds 32 MiB"));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| GatewayError::infrastructure("Media download did not complete"))?
+    {
+        if bytes.len() + chunk.len() > MAX_MEDIA_BYTES {
+            return Err(GatewayError::validation("Media exceeds 32 MiB"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err(GatewayError::validation("Media is empty"));
+    }
+    Ok(bytes)
+}
+
+/// Audio generated by Beacon is fetched only from its configured loopback origin.
+pub async fn fetch_beacon_audio(
+    artifact: &Value,
+    beacon_origin: &str,
+) -> Result<Vec<u8>, GatewayError> {
+    let download = artifact.pointer("/metadata/download").ok_or_else(|| {
+        GatewayError::validation("Audio artifact requires an HTTP download descriptor")
+    })?;
+    let raw_url = download
+        .get("url")
+        .and_then(Value::as_str)
+        .or_else(|| artifact.get("url").and_then(Value::as_str))
+        .unwrap_or("");
+    let url =
+        Url::parse(raw_url).map_err(|_| GatewayError::validation("Invalid audio download URL"))?;
+    let origin = Url::parse(beacon_origin)
+        .map_err(|_| GatewayError::validation("Invalid configured Beacon origin"))?;
+    let host = url.host_str().unwrap_or_default();
+    let local = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !local
+        || url.origin() != origin.origin()
+        || !url.path().starts_with("/api/web/media/")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(GatewayError::validation(
+            "Audio download must use the configured local Beacon origin",
+        ));
+    }
+    if download
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("GET")
+        != "GET"
+    {
+        return Err(GatewayError::validation("Audio download requires GET"));
+    }
+    let auth = download
+        .pointer("/headers/Authorization")
+        .and_then(Value::as_str)
+        .filter(|s| s.starts_with("Bearer "))
+        .ok_or_else(|| GatewayError::validation("Audio download capability is missing"))?;
+    let expiry = download
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .ok_or_else(|| GatewayError::validation("Audio download expiry is missing"))?;
+    if expiry <= Utc::now() {
+        return Err(GatewayError::validation(
+            "Audio download capability has expired",
+        ));
+    }
+    let response = media_client(20)
+        .get(url)
+        .header("Authorization", auth)
+        .send()
+        .await
+        .map_err(|_| GatewayError::infrastructure("Beacon audio download did not complete"))?;
+    read_bounded_response(response).await
+}
+
+/// Return duration only for the exact ASR input format, checking RIFF chunks.
+pub fn pcm_wav_duration_ms(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut cursor = 12usize;
+    let mut valid_format = false;
+    let mut data_bytes = None;
+    while cursor.checked_add(8)? <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().ok()?) as usize;
+        let start = cursor.checked_add(8)?;
+        let end = start.checked_add(size)?;
+        if end > bytes.len() {
+            return None;
+        }
+        if &bytes[cursor..cursor + 4] == b"fmt " {
+            if size < 16 {
+                return None;
+            }
+            valid_format = u16::from_le_bytes(bytes[start..start + 2].try_into().ok()?) == 1
+                && u16::from_le_bytes(bytes[start + 2..start + 4].try_into().ok()?) == 1
+                && u32::from_le_bytes(bytes[start + 4..start + 8].try_into().ok()?) == 16000
+                && u16::from_le_bytes(bytes[start + 14..start + 16].try_into().ok()?) == 16;
+        } else if &bytes[cursor..cursor + 4] == b"data" {
+            data_bytes = Some(size);
+        }
+        cursor = end.checked_add(size % 2)?;
+    }
+    let length = data_bytes?;
+    (valid_format && length > 0 && length % 2 == 0).then_some((length as u64 * 1000) / 32000)
+}
+
+pub async fn normalize_inbound_audio(
+    ffmpeg: &Path,
+    root: &Path,
+    bytes: &[u8],
+) -> Result<(Vec<u8>, u64), GatewayError> {
+    if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES {
+        return Err(GatewayError::validation("Invalid inbound audio size"));
+    }
+    if let Some(duration) = pcm_wav_duration_ms(bytes) {
+        return Ok((bytes.to_vec(), duration));
+    }
+    tokio::fs::create_dir_all(root).await?;
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let input = root.join(format!("inbound-{id}.bin"));
+    let output = root.join(format!("inbound-{id}.wav"));
+    tokio::fs::write(&input, bytes).await?;
+    let result = async {
+        let mut command = tokio::process::Command::new(ffmpeg);
+        command
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&input)
+            .args([
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                "-fs",
+                "33554433",
+                "-f",
+                "wav",
+            ])
+            .arg(&output)
+            .kill_on_drop(true);
+        let completed = tokio::time::timeout(Duration::from_secs(20), command.output())
+            .await
+            .map_err(|_| GatewayError::infrastructure("Inbound audio normalization timed out"))?
+            .map_err(|_| GatewayError::infrastructure("Configured ffmpeg could not start"))?;
+        if !completed.status.success() {
+            return Err(GatewayError::validation(
+                "Inbound audio could not be decoded",
+            ));
+        }
+        let meta = tokio::fs::metadata(&output).await?;
+        if meta.len() == 0 || meta.len() >= MAX_MEDIA_BYTES as u64 {
+            return Err(GatewayError::validation("Normalized audio exceeds 32 MiB"));
+        }
+        let wav = tokio::fs::read(&output).await?;
+        let duration = pcm_wav_duration_ms(&wav).ok_or_else(|| {
+            GatewayError::validation("Normalized audio is not mono 16 kHz PCM WAV")
+        })?;
+        Ok((wav, duration))
+    }
+    .await;
+    let _ = tokio::fs::remove_file(input).await;
+    let _ = tokio::fs::remove_file(output).await;
+    result
+}
+
+pub async fn convert_to_opus(
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+) -> Result<(), GatewayError> {
+    let mut command = tokio::process::Command::new(ffmpeg);
+    command
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(input)
+        .args([
+            "-vn", "-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-f", "opus",
+        ])
+        .arg(output)
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(Duration::from_secs(20), command.output())
+        .await
+        .map_err(|_| GatewayError::infrastructure("Audio conversion timed out"))?
+        .map_err(|_| GatewayError::infrastructure("Configured ffmpeg could not start"))?;
+    if !status.status.success() {
+        return Err(GatewayError::infrastructure("Audio conversion failed"));
+    }
+    let meta = tokio::fs::metadata(output).await?;
+    if meta.len() == 0 || meta.len() > MAX_MEDIA_BYTES as u64 {
+        return Err(GatewayError::validation("Invalid converted audio size"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn file_cache_preserves_opaque_bytes_and_treats_names_as_display_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(dir.path().into(), 8787).unwrap();
+        let bytes = b"opaque, not parsed by Gate";
+        let part = cache
+            .store_file(
+                "att_file",
+                bytes,
+                "invalid\r\nheader",
+                "../../..",
+                "om_file",
+            )
+            .unwrap();
+        assert_eq!(part["type"], "file");
+        assert_eq!(part["name"], "document");
+        assert_eq!(part["mime_type"], "application/octet-stream");
+        assert_eq!(
+            part["metadata"]["sha256"],
+            format!("{:x}", Sha256::digest(bytes))
+        );
+        assert_eq!(
+            cache
+                .store_file(
+                    "att_file",
+                    b"replacement",
+                    "text/plain",
+                    "other.txt",
+                    "om_other"
+                )
+                .unwrap(),
+            part
+        );
+        assert!(cache
+            .store_file("att_empty", b"", "", "empty.pdf", "om_empty")
+            .is_err());
+        assert!(cache
+            .store_file(
+                "att_large",
+                &vec![0; MAX_MEDIA_BYTES + 1],
+                "",
+                "large.pdf",
+                "om_large"
+            )
+            .is_err());
+        assert!(cache
+            .store_file("../outside", bytes, "", "document.pdf", "om_file")
+            .is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn existing_audio_and_image_cache_entries_remain_compatible_without_file_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(dir.path().into(), 8787).unwrap();
+        let audio = cache
+            .store("att_audio", b"audio", "audio/opus", 100)
+            .unwrap();
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let image = cache
+            .store_image("att_image", encoded.get_ref(), "om_image")
+            .unwrap();
+        for (id, expected) in [("att_audio", audio), ("att_image", image)] {
+            let path = dir.path().join(format!("{id}.json"));
+            let mut entry: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            entry.as_object_mut().unwrap().remove("file_metadata");
+            std::fs::write(path, serde_json::to_vec(&entry).unwrap()).unwrap();
+            assert_eq!(cache.descriptor(id).unwrap().unwrap(), expected);
+            assert!(cache
+                .read(
+                    id,
+                    expected["download"]["headers"]["Authorization"]
+                        .as_str()
+                        .unwrap()
+                )
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn image_validation_rejects_large_dimensions_and_payloads_before_decoding() {
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        for (width, height) in [(8001_u32, 8000_u32), (16385, 1)] {
+            let mut bytes = encoded.get_ref().clone();
+            bytes[16..20].copy_from_slice(&width.to_be_bytes());
+            bytes[20..24].copy_from_slice(&height.to_be_bytes());
+            // Recompute IHDR CRC so the fixture tests dimensions, not corruption.
+            let mut crc = !0_u32;
+            for byte in &bytes[12..29] {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb88320_u32 & (0_u32.wrapping_sub(crc & 1)));
+                }
+            }
+            bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+            assert!(validate_image(&bytes)
+                .unwrap_err()
+                .message
+                .contains("decoding limit"));
+        }
+        assert!(validate_image(&vec![0; MAX_MEDIA_BYTES + 1])
+            .unwrap_err()
+            .message
+            .contains("32 MiB"));
+        let mut corrupted = encoded.into_inner();
+        corrupted.truncate(corrupted.len() / 2);
+        assert!(validate_image(&corrupted)
+            .unwrap_err()
+            .message
+            .contains("JPEG or PNG"));
+    }
+    #[test]
+    fn capability_is_stable_and_cannot_read_another_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(dir.path().into(), 8787).unwrap();
+        let part = cache
+            .store("att_one", b"audio", "audio/opus", 1200)
+            .unwrap();
+        assert_eq!(
+            cache.store("att_one", b"changed", "audio/opus", 3).unwrap(),
+            part
+        );
+        let auth = part
+            .pointer("/download/headers/Authorization")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(cache.read("att_one", auth).unwrap().1, b"audio");
+        assert!(cache.read("att_two", auth).is_err());
+        assert!(cache.read("att_one", "Bearer wrong").is_err());
+        assert!(cache.read("../secret", auth).is_err());
+    }
+    #[test]
+    fn expired_capability_and_oversize_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(dir.path().into(), 8787).unwrap();
+        let part = cache.store("att_one", b"audio", "audio/opus", 1).unwrap();
+        let manifest = dir.path().join("att_one.json");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        value["expires_at"] = json!((Utc::now() - ChronoDuration::seconds(1)).to_rfc3339());
+        std::fs::write(manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(cache
+            .read(
+                "att_one",
+                part["download"]["headers"]["Authorization"]
+                    .as_str()
+                    .unwrap()
+            )
+            .is_err());
+        assert!(cache
+            .store("att_large", &vec![0; MAX_MEDIA_BYTES + 1], "audio/opus", 1)
+            .is_err());
+    }
+    #[tokio::test]
+    async fn outbound_audio_rejects_foreign_origin_before_network() {
+        let artifact = json!({"metadata":{"download":{"url":"https://outside.invalid/a.wav"}}});
+        assert!(fetch_beacon_audio(&artifact, "http://127.0.0.1:4174")
+            .await
+            .is_err());
+    }
+}
