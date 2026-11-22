@@ -1,0 +1,26 @@
+{
+  "contracts": [
+    {
+      "capabilities": [
+        "beacon-gate-contract-2.0",
+        "harboros-auth-token-validation",
+        "loopback-only",
+        "per-artifact-video-delivery",
+        "persistent-delivery-retry",
+        "platform-credential-ownership",
+        "service-bearer-redaction",
+        "authenticated-browser-proxy",
+        "feishu-voice-media",
+        "feishu-image-ingress",
+        "feishu-file-ingress",
+        "native-model-choice-card"
+      ],
+      "id": "harboros.nexus.gate-v2-transport",
+      "version": 1
+    }
+  ],
+  "package": "harboros-im-gate",
+  "product_profile": "nexus-amd64",
+  "schema_version": 1,
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER"
+}

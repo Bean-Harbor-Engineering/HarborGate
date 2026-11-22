@@ -174,6 +174,7 @@ fn config(root: &std::path::Path, origin: &str) -> AppConfig {
     cfg.data_dir = root.join("sessions");
     cfg.state_dir = root.join("state");
     cfg.harborbeacon_base_url = origin.into();
+    cfg.harborbeacon_token = "mock-beacon-token-for-formal-transport".into();
     cfg.feishu.base_url = origin.into();
     cfg.feishu.auth_base_url = origin.into();
     cfg.feishu.app_id = "mock_app".into();
@@ -219,6 +220,12 @@ async fn jpeg_and_png_reach_v2_with_original_bytes_and_stable_capability_after_r
                 gateway.clone(),
             )),
             feishu_websocket_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            harboros_authenticator: Arc::new(
+                harborgate::harboros_auth::MiddlewareHarborOsAuthenticator::default(),
+            ),
+            device_sessions: Arc::new(harborgate::device_session::DeviceSessionStore::new(
+                temp.path().join("device-sessions"),
+            )),
         };
         let media_task = tokio::spawn(async move {
             axum::serve(listener, harborgate::server::router(app_state))

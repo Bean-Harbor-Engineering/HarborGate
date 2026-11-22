@@ -1,0 +1,14 @@
+{
+  "package": "harboros-im-gate",
+  "product_profile": "nexus-amd64",
+  "qualification_required": true,
+  "required_checks": [
+    "authenticated-nas-browser-proxy",
+    "feishu-voice-media-roundtrip",
+    "native-model-card-private-operator",
+    "persistent-delivery-retry"
+  ],
+  "schema_version": 1,
+  "scope": "Package construction verifies amd64 ELF and contracts; live device acceptance is required before release promotion.",
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER"
+}

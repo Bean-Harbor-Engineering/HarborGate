@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+root=/var/lib/harboros-im-gate
+for path in "$root" "$root/sessions" "$root/weixin" "$root/device-sessions"; do
+  if [ -L "$path" ]; then
+    echo "error: refusing symlinked HarborGate data path: $path" >&2
+    exit 1
+  fi
+done
+install -d -m 0700 "$root" "$root/sessions" "$root/weixin" "$root/device-sessions"

@@ -209,6 +209,13 @@ impl SetupPortalService {
         request_host: &str,
         route_prefix: &str,
     ) -> String {
+        if self.config.runtime_profile == "nexus" {
+            return portal_document(
+                "消息连接",
+                r#"<section class="card stack"><h1>消息连接</h1><p>请在 HarborOS 中管理连接。</p><a href="/ui/harbor-assistant?tab=messages">打开 Harbor Assistant</a></section>"#,
+                true,
+            );
+        }
         let prefix = normalized_route_prefix(route_prefix);
         let status = self.status_payload_with_prefix(request_host, &prefix);
         let feishu = &status["feishu"];
@@ -314,6 +321,13 @@ impl SetupPortalService {
         unbound: bool,
         route_prefix: &str,
     ) -> String {
+        if self.config.runtime_profile == "nexus" {
+            return portal_document(
+                "消息连接",
+                r#"<section class="card stack"><h1>消息连接</h1><p>请在 HarborOS 中管理连接。</p><a href="/ui/harbor-assistant?tab=messages">打开 Harbor Assistant</a></section>"#,
+                true,
+            );
+        }
         let prefix = normalized_route_prefix(route_prefix);
         let status = self.status_payload_with_prefix(request_host, &prefix);
         let weixin = &status["weixin"];
@@ -462,6 +476,13 @@ impl SetupPortalService {
     }
 
     pub fn build_qr_page_with_prefix(&self, route_prefix: &str) -> String {
+        if self.config.runtime_profile == "nexus" {
+            return portal_document(
+                "消息连接",
+                r#"<section class="card stack"><h1>消息连接</h1><p>请在 HarborOS 中管理连接。</p><a href="/ui/harbor-assistant?tab=messages">打开 Harbor Assistant</a></section>"#,
+                true,
+            );
+        }
         let prefix = normalized_route_prefix(route_prefix);
         let qr_svg_url = prefixed_path(&prefix, "/setup/feishu/qr.svg");
         portal_document(
@@ -493,6 +514,9 @@ impl SetupPortalService {
         request_host: &str,
         route_prefix: &str,
     ) -> String {
+        if self.config.runtime_profile == "nexus" {
+            return qr_to_svg("/ui/harbor-assistant?tab=messages");
+        }
         let status = self.status_payload_with_prefix(request_host, route_prefix);
         let target = status
             .pointer("/feishu/setup_url")

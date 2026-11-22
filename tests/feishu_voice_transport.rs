@@ -186,6 +186,7 @@ async fn audio_normalization_download_and_duplicate_text_use_real_transport() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     config.port = listener.local_addr().unwrap().port();
     config.harborbeacon_base_url = origin.clone();
+    config.harborbeacon_token = "mock-beacon-token-for-formal-transport".into();
     let gateway = Arc::new(GatewayService::from_config(&config).unwrap());
     let router = Router::new()
         .route("/api/media/{id}", get(cached_media))
@@ -215,13 +216,23 @@ async fn audio_normalization_download_and_duplicate_text_use_real_transport() {
         .unwrap();
     gateway.handle_inbound("feishu", payload).await.unwrap();
     let messages = state.messages.lock().unwrap().clone();
-    let ack_count = messages.iter().filter(|message| {
-        serde_json::from_str::<Value>(message["content"].as_str().unwrap_or("{}"))
-            .ok().is_some_and(|body| body["text"] == "收到，正在处理…")
-    }).count();
-    assert_eq!(ack_count, 1, "the voice message has one transport acknowledgement");
-    assert_eq!(messages.len() - ack_count, 2,
-        "each unique voice/text business result must still send exactly once");
+    let ack_count = messages
+        .iter()
+        .filter(|message| {
+            serde_json::from_str::<Value>(message["content"].as_str().unwrap_or("{}"))
+                .ok()
+                .is_some_and(|body| body["text"] == "收到，正在处理…")
+        })
+        .count();
+    assert_eq!(
+        ack_count, 1,
+        "the voice message has one transport acknowledgement"
+    );
+    assert_eq!(
+        messages.len() - ack_count,
+        2,
+        "each unique voice/text business result must still send exactly once"
+    );
     let restarted = GatewayService::from_config(&config).unwrap();
     restarted
         .handle_inbound("feishu", event("text", "om_once", json!({"text":"hello"})))
@@ -306,6 +317,48 @@ async fn partial_retry_skips_caption_and_original_file_bytes_are_preserved() {
         "file",
         "image MIME must not reclassify requested original as image"
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn distinct_ledger_items_keep_distinct_provider_ids_and_replay_checkpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = Arc::new(Mock::default());
+    let (origin, task) = provider(state.clone()).await;
+    let cfg = config(temp.path(), &origin);
+    let adapter = FeishuAdapter::with_media(
+        cfg.feishu,
+        temp.path().join("out"),
+        "ffmpeg".into(),
+        "http://127.0.0.1:4174".into(),
+    );
+    let image = temp.path().join("original.jpg");
+    std::fs::write(&image, b"original-image").unwrap();
+    let mut first = outbound(
+        vec![json!({"kind":"image","path":image,"mime_type":"image/jpeg"})],
+        "same-turn",
+    );
+    first.text.clear();
+    first
+        .metadata
+        .insert("delivery_item_key".into(), json!("first-image"));
+    let mut second = first.clone();
+    second
+        .metadata
+        .insert("delivery_item_key".into(), json!("second-image"));
+    assert_eq!(
+        adapter.send_outbound(first.clone()).await.unwrap()["sent"],
+        true
+    );
+    assert_eq!(adapter.send_outbound(second).await.unwrap()["sent"], true);
+    assert_eq!(adapter.send_outbound(first).await.unwrap()["sent"], true);
+    let messages = state.messages.lock().unwrap();
+    assert_eq!(
+        messages.len(),
+        2,
+        "replay must reuse only its own item checkpoint"
+    );
+    assert_ne!(messages[0]["uuid"], messages[1]["uuid"]);
     task.abort();
 }
 
@@ -397,6 +450,7 @@ async fn restart_pending_audio_replays_identical_turn_to_refresh_expired_capabil
     let (origin, task) = provider(state.clone()).await;
     let mut cfg = config(temp.path(), &origin);
     cfg.harborbeacon_base_url = origin.clone();
+    cfg.harborbeacon_token = "mock-beacon-token-for-formal-transport".into();
     let gateway = GatewayService::from_config(&cfg).unwrap();
     let request = event("text", "om_expired", json!({"text":"retry expired audio"}));
     let initial = gateway
@@ -456,7 +510,7 @@ async fn inbound_opus_is_normalized_to_mono_16k_pcm_wav() {
     .await
     .unwrap();
     assert_eq!(harborgate::media::pcm_wav_duration_ms(&wav), Some(duration));
-    assert!(duration >= 90 && duration <= 110);
+    assert!((90..=110).contains(&duration));
     assert!(wav.starts_with(b"RIFF"));
 }
 
@@ -519,6 +573,12 @@ async fn notification_http_reports_partial_and_retry_only_sends_missing_part() {
         gateway: gateway.clone(),
         setup: Arc::new(harborgate::setup::SetupPortalService::new(cfg, gateway)),
         feishu_websocket_started: Arc::new(AtomicBool::new(false)),
+        harboros_authenticator: Arc::new(
+            harborgate::harboros_auth::MiddlewareHarborOsAuthenticator::default(),
+        ),
+        device_sessions: Arc::new(harborgate::device_session::DeviceSessionStore::new(
+            temp.path().join("device-sessions"),
+        )),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!(

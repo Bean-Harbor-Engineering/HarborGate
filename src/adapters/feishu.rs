@@ -617,28 +617,21 @@ impl FeishuAdapter {
     fn checkpoint_path(&self, outbound: &OutboundMessage, index: usize) -> Option<PathBuf> {
         let turn = outbound
             .metadata
-            .get("turn_id")
+            .get("delivery_item_key")
+            .or_else(|| outbound.metadata.get("turn_id"))
             .or_else(|| outbound.metadata.get("idempotency_key"))?
             .as_str()?;
-        let scope = outbound
-            .metadata
-            .get("delivery_item_key")
-            .and_then(Value::as_str);
-        let identity = match scope {
-            Some(scope) => format!(
-                "{}|{}|{}|{}|{}",
-                outbound.platform, outbound.chat_id, turn, scope, index
-            ),
-            None => format!(
-                "{}|{}|{}|{}",
-                outbound.platform, outbound.chat_id, turn, index
-            ),
-        };
-        Some(
-            self.media_root
-                .join("deliveries")
-                .join(format!("{}.json", stable_id("part_", &identity, 40))),
-        )
+        Some(self.media_root.join("deliveries").join(format!(
+            "{}.json",
+            stable_id(
+                "part_",
+                &format!(
+                    "{}|{}|{}|{}",
+                    outbound.platform, outbound.chat_id, turn, index
+                ),
+                40
+            )
+        )))
     }
 
     fn cached_part(
@@ -791,7 +784,8 @@ impl FeishuAdapter {
     ) -> Result<Value, GatewayError> {
         if let Some(identity) = outbound
             .metadata
-            .get("turn_id")
+            .get("delivery_item_key")
+            .or_else(|| outbound.metadata.get("turn_id"))
             .or_else(|| outbound.metadata.get("idempotency_key"))
             .and_then(Value::as_str)
         {

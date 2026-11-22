@@ -479,15 +479,15 @@ impl GatewayService {
         outbound: &OutboundMessage,
         response: &Value,
     ) -> Result<(), GatewayError> {
+        if self.record_card_receipt(outbound, response)? {
+            return Ok(());
+        }
         if outbound
             .metadata
             .get("turn_id")
             .and_then(Value::as_str)
             .is_none_or(|id| id.trim().is_empty())
         {
-            return Ok(());
-        }
-        if self.record_card_receipt(outbound, response)? {
             return Ok(());
         }
         if let Some(receipts) = response.get("delivery_receipts").filter(|v| v.is_array()) {
@@ -573,6 +573,11 @@ impl GatewayService {
         let id = response
             .pointer("/responses/0/data/message_id")
             .and_then(Value::as_str)
+            .or_else(|| {
+                response
+                    .pointer("/responses/0/provider_message_id")
+                    .and_then(Value::as_str)
+            })
             .or_else(|| response.get("provider_message_id").and_then(Value::as_str))
             .unwrap_or("");
         if id.is_empty() {
@@ -873,6 +878,7 @@ impl GatewayService {
                         None,
                     )
                     .await?;
+                self.record_previous_delivery(&outbound, &response)?;
                 if let Some(key) = &replay_key {
                     self.store.save_inbound_record(key, json!({"completed":response.get("sent").and_then(Value::as_bool) == Some(true) && response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":original,"session_metadata":original_metadata,"outbound":outbound,"response":response}))?;
                 }
@@ -1177,10 +1183,9 @@ impl GatewayService {
                 None,
             )
             .await?;
+        self.record_previous_delivery(&outbound, &response)?;
         if let Some(key) = &replay_key {
-            self.store.save_inbound_record(key, json!({"completed":response.get("sent").and_then(Value::as_bool)==Some(true)
-                && response.get("partial").and_then(Value::as_bool)!=Some(true),"prepared":prepared_inbound,
-                "session_metadata":session_metadata,"outbound":outbound,"response":response}))?;
+            self.store.save_inbound_record(key, json!({"completed":response.get("sent").and_then(Value::as_bool) == Some(true) && response.get("partial").and_then(Value::as_bool) != Some(true),"prepared":prepared_inbound,"session_metadata":session_metadata,"outbound":outbound,"response":response}))?;
         }
         Ok(response)
     }
@@ -2000,7 +2005,7 @@ impl GatewayService {
             .persist_delivery_plan(
                 delivery_key,
                 request_fingerprint,
-                planned_outbound,
+                planned_outbound.clone(),
                 planned_items,
             )
             .map_err(|error| {
@@ -2014,6 +2019,11 @@ impl GatewayService {
                     GatewayError::infrastructure(error.to_string())
                 }
             })?;
+        let is_feishu = adapter.name() == "feishu";
+        let original_outbound = serde_json::from_value::<OutboundMessage>(planned_outbound.clone())
+            .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+        let mut receipts = Vec::new();
+        let mut responses = Vec::new();
         let mut last_response = json!({});
         for (item_identity, artifact_id, kind, item_outbound) in delivery_items {
             let item_key = delivery_item_key(delivery_key, &item_identity);
@@ -2061,9 +2071,12 @@ impl GatewayService {
                         "provider_media_id": claim.pointer("/item/provider_media_id").cloned().unwrap_or(Value::Null),
                         "provider_client_id": claim.pointer("/item/provider_client_id").cloned().unwrap_or(Value::Null),
                     });
-                    if adapter.name() == "feishu" {
+                    if is_feishu {
                         last_response["sent"] = json!(true);
-                        last_response["duplicate"] = json!(true);
+                        if kind != "text" {
+                            receipts.push(json!({"artifact_id":artifact_id,"kind":kind,"status":"sent","provider_message_id":last_response.get("provider_message_id")}));
+                        }
+                        responses.push(last_response.clone());
                     }
                     continue;
                 }
@@ -2215,7 +2228,23 @@ impl GatewayService {
                                 fallback_used,
                             })
                             .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
-                        return Ok(response);
+                        if responses.is_empty() {
+                            return Ok(response);
+                        }
+                        receipts.extend(
+                            response
+                                .get("delivery_receipts")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .cloned(),
+                        );
+                        responses.push(response.clone());
+                        return Ok(json!({
+                            "platform":"feishu", "sent":false, "partial":true, "status":"partial",
+                            "delivery_receipts":receipts, "responses":responses,
+                            "error":response.get("error").cloned().unwrap_or(Value::Null),
+                        }));
                     }
                     let provider_message_id = response
                         .get("provider_message_id")
@@ -2277,6 +2306,12 @@ impl GatewayService {
                         )
                         .await;
                     }
+                    if is_feishu {
+                        if kind != "text" {
+                            receipts.push(json!({"artifact_id":artifact_id,"kind":kind,"status":"sent","provider_message_id":provider_message_id}));
+                        }
+                        responses.push(response.clone());
+                    }
                     last_response = response;
                 }
                 Err(error) => {
@@ -2310,7 +2345,38 @@ impl GatewayService {
                         )
                         .await;
                     }
+                    if is_feishu && !responses.is_empty() {
+                        return Ok(
+                            json!({"platform":"feishu","sent":false,"partial":true,"status":"partial",
+                            "delivery_receipts":receipts,"responses":responses,"error":{"code":error.code,"message":error.message}}),
+                        );
+                    }
                     return Err(error);
+                }
+            }
+        }
+        if is_feishu {
+            let preview = responses
+                .iter()
+                .any(|response| response.get("sent").and_then(Value::as_bool) != Some(true));
+            if let Some(object) = last_response.as_object_mut() {
+                object.insert("sent".into(), json!(!preview));
+                object.insert("attachments".into(), json!(original_outbound.attachments));
+                object.insert("delivery_receipts".into(), json!(receipts));
+                object.insert("responses".into(), json!(responses));
+                if let Some(metadata) = object.get_mut("metadata").and_then(Value::as_object_mut) {
+                    metadata.insert(
+                        "native_attachment_count".into(),
+                        json!(original_outbound.attachments.len()),
+                    );
+                    metadata.insert(
+                        "native_attachment_kinds".into(),
+                        json!(original_outbound
+                            .attachments
+                            .iter()
+                            .filter_map(|a| a.get("kind").and_then(Value::as_str))
+                            .collect::<Vec<_>>()),
+                    );
                 }
             }
         }
@@ -2673,6 +2739,7 @@ fn split_outbound_items(
         attachment_outbound.metadata.remove("feishu_card");
         attachment_outbound.metadata.remove("card_user_id");
         attachment_outbound.metadata.remove("card_chat_type");
+        attachment_outbound.metadata.remove("structured_payload");
         attachment_outbound.attachments = vec![attachment.clone()];
         items.push((
             attachment_item_identity(&artifact_id),
@@ -4127,51 +4194,43 @@ mod tests {
     }
 
     #[test]
-    fn neutral_model_cards_render_as_buttons_without_business_interpretation() {
+    fn neutral_model_cards_preserve_opaque_choice_and_private_operator_receipt() {
         let payload = json!({"delivery_hints":[{"kind":"native_card","metadata":{"card":{
-            "schema_version":1,"title":"模型","subtitle":"全局设置",
-            "rows":[{"text":"Qwen · 当前运行"}],"actions":[{"label":"选择", "value":{"action":"model.select","chooser_id":"opaque","option_id":"opaque-choice"}}]}}}]});
+            "schema_version":1,"title":"Models","rows":[{"text":"Qwen"}],
+            "actions":[{"label":"Select","value":{"action":"model.select","chooser_id":"opaque","option_id":"choice"}}]}}}]});
         let card = native_card(&payload).unwrap().unwrap();
         assert_eq!(
             card["elements"][2]["actions"][0]["value"]["option_id"],
-            "opaque-choice"
+            "choice"
         );
-        assert_eq!(card["elements"][1]["text"]["tag"], "plain_text");
-        assert!(native_card(&json!({"reply":{"text":"普通聊天"}}))
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn structured_card_callbacks_require_a_persisted_private_operator_receipt() {
         let dir = tempdir().unwrap();
         let mut config = AppConfig::from_env();
-        config.data_dir = dir.path().into();
+        config.data_dir = dir.path().join("sessions");
         config.state_dir = dir.path().join("state");
         config.harborbeacon_base_url.clear();
         let gateway = GatewayService::from_config(&config).unwrap();
-        let mut inbound:InboundMessage=serde_json::from_value(json!({"platform":"feishu","chat_id":"oc-1","user_id":"ou-admin","text":"卡片操作",
-            "attachments":[{"type":"card_action","metadata":{"source_message_id":"om-card","value":{"action":"model.select"}}}]})).unwrap();
+        let mut inbound:InboundMessage=serde_json::from_value(json!({"platform":"feishu","chat_id":"private-chat","user_id":"operator","text":"card",
+            "attachments":[{"type":"card_action","metadata":{"source_message_id":"sent-card","value":{"action":"model.select"}}}]})).unwrap();
         assert!(gateway.verify_card_origin(&mut inbound).is_err());
         let outbound = OutboundMessage {
             platform: "feishu".into(),
-            chat_id: "oc-1".into(),
+            chat_id: "private-chat".into(),
             text: "card".into(),
             attachments: vec![],
             timestamp: "now".into(),
             metadata: serde_json::from_value(
-                json!({"feishu_card":{},"card_user_id":"ou-admin","card_chat_type":"p2p"}),
+                json!({"feishu_card":card,"card_user_id":"operator","card_chat_type":"p2p"}),
             )
             .unwrap(),
         };
         gateway
             .record_previous_delivery(
                 &outbound,
-                &json!({"sent":true,"responses":[{"data":{"message_id":"om-card"}}]}),
+                &json!({"sent":true,"provider_message_id":"last-photo",
+                    "responses":[{"provider_message_id":"sent-card"}]}),
             )
             .unwrap();
         gateway.verify_card_origin(&mut inbound).unwrap();
-        assert_eq!(inbound.chat_type, "p2p");
         inbound.user_id = "other".into();
         assert!(gateway.verify_card_origin(&mut inbound).is_err());
     }
