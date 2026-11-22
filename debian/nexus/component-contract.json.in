@@ -21,6 +21,9 @@
   ],
   "package": "harboros-im-gate",
   "product_profile": "nexus-amd64",
+  "candidate_status": "qualified_component",
+  "release_eligible": true,
+  "blocking_reasons": [],
   "schema_version": 1,
   "source_commit": "SOURCE_COMMIT_PLACEHOLDER"
 }
