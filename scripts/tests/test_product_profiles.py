@@ -10,6 +10,21 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "debian/nexus/component-contract.json.in",
+        "debian/nexus/runtime-evidence-required.json.in",
+    ],
+)
+def test_nexus_release_json_templates_are_canonical(relative_path):
+    path = ROOT / relative_path
+    payload = path.read_text(encoding="utf-8")
+    value = json.loads(payload)
+    canonical = json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    assert payload == canonical
+
+
 def test_nexus_unit_and_dependency_lane_do_not_inherit_n2_bootstrap():
     unit=(ROOT/"debian/nexus/harboros-im-gate.service").read_text()
     control=(ROOT/"debian/nexus/control").read_text()
